@@ -2,15 +2,19 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# system deps (optional, aber oft hilfreich)
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    python3-dev \
     gcc \
+    g++ \
+    git \
+    curl \
  && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --upgrade pip setuptools wheel \
+ && pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# LiveKit Agent process
 CMD ["python", "agent.py", "start"]
