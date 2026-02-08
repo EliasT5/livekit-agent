@@ -8,10 +8,11 @@ import json
 import logging
 import os
 import re
+import math
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 from dotenv import load_dotenv, find_dotenv
 
@@ -152,7 +153,8 @@ def _default_config() -> Dict[str, Any]:
                 "per Tool verifizieren -> Serviceauftrag aufnehmen -> am Ende kurz zusammenfassen.\n"
                 "Regeln: Keine Emojis. Kurze Sätze. Immer eine Frage auf einmal."
             ),
-            "welcome_message": "Willkommen beim Service. Bitte nennen Sie mir Ihre Kundennummer.",
+            # Fallback-first: Hinweis, dass Identifikation auch ohne Kundennummer möglich ist
+            "welcome_message": "Willkommen beim Service. Bitte nennen Sie Ihre Kundennummer ODER Firma und Ort.",
         },
         "speech": {
             "stt_languages": ["de-AT", "de-DE"],
@@ -169,6 +171,30 @@ def _default_config() -> Dict[str, Any]:
             "ask_caller_name": True,
             "max_attempts": 3,
             "match_policy": "firm_or_site",  # firm_or_site, firm_and_site
+            # --- Fuzzy (fallback-first; Dashboard-Felder nicht erforderlich) ---
+            "fuzzy": {
+                "enabled": True,
+                "max_candidates_internal": 5,
+                "thresholds": {"allow": 0.86, "ask": 0.72, "block": 0.50},
+                "weights": {
+                    "name": 0.40,
+                    "ort": 0.25,
+                    "plz": 0.20,
+                    "addr": 0.05,
+                    "phone": 0.10,
+                    "email_domain": 0.10,
+                },
+                "normalization": {
+                    "umlaute": "ae_oe_ue",
+                    "eszett": "ss",
+                    "punct": "drop",
+                    "spaces": "collapse"
+                },
+                "phonetic": "koelner",
+                "stt": {"use_nbest": True, "phrase_hints": "from_csv"},
+                "disambiguation": {"max_turns": 2, "order": ["plz", "ort", "email_domain", "strassen_prefix"]},
+                "privacy": {"no_candidate_enumeration": True, "masked_confirmations_only": True},
+            },
         },
         "email": {
             "enabled": False,
@@ -226,6 +252,13 @@ class SessionArtifacts:
     call_id: Optional[str] = None
 
     verification_attempts: int = 0
+
+    # --- Fuzzy diagnostics (internal; maskierte, auditierbare Angaben) ---
+    fz_decision: Optional[str] = None                 # "allow" | "ask" | "block"
+    fz_score: Optional[float] = None
+    fz_coverage_ok: Optional[bool] = None
+    fz_features: Dict[str, float] = field(default_factory=dict)   # name/ort/plz/addr/phone/email_domain
+    fz_asked: List[str] = field(default_factory=list)             # welche Merkmale wurden bereits erfragt
 
 
 # -----------------------------------------------------------------------------
@@ -398,7 +431,7 @@ def _send_email_with_attachments(
 
 
 # -----------------------------------------------------------------------------
-# Customer verification + service order tools
+# Helpers: config access
 # -----------------------------------------------------------------------------
 
 def _get_cfg(artifacts: SessionArtifacts, *path: str, default: Any = None) -> Any:
@@ -409,6 +442,165 @@ def _get_cfg(artifacts: SessionArtifacts, *path: str, default: Any = None) -> An
         cur = cur.get(p)
     return default if cur is None else cur
 
+
+# -----------------------------------------------------------------------------
+# >>>>>>  Fuzzy utilities (local, fallback-first, no extra deps)  <<<<<<
+# -----------------------------------------------------------------------------
+
+# Lightweight normalization & similarity helpers to support robust fuzzy search
+_LEGAL_SUFFIX_STOPWORDS: Set[str] = {
+    "gmbh", "mbh", "ag", "kg", "ug", "ohg", "kgaa", "co", "co.", "holding", "gruppe", "group"
+}
+
+def _collapse_spaces(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
+
+def _strip_punct(s: str) -> str:
+    return re.sub(r"[^\w\s\-]", " ", s or "")
+
+def _german_umlaut_norm(s: str, cfg: Dict[str, Any]) -> str:
+    if not s:
+        return s
+    # default behaviour: ae/oe/ue, ss
+    if (cfg or {}).get("umlaute", "ae_oe_ue") == "ae_oe_ue":
+        s = (
+            s.replace("Ä", "Ae").replace("Ö", "Oe").replace("Ü", "Ue")
+             .replace("ä", "ae").replace("ö", "oe").replace("ü", "ue")
+        )
+    if (cfg or {}).get("eszett", "ss") == "ss":
+        s = s.replace("ß", "ss")
+    return s
+
+def normalize_text(s: str, norm_cfg: Dict[str, Any]) -> str:
+    """
+    - casefold
+    - german umlauts + ß -> ae/oe/ue/ss (configurable)
+    - drop punctuation (configurable)
+    - collapse spaces
+    - drop common legal suffixes
+    """
+    s = s or ""
+    s = _german_umlaut_norm(s, norm_cfg)
+    if (norm_cfg or {}).get("punct", "drop") == "drop":
+        s = _strip_punct(s)
+    s = _collapse_spaces(s)
+    s = s.casefold()
+    # drop common legal suffixes (token-level)
+    tokens = [t for t in s.split(" ") if t and (t not in _LEGAL_SUFFIX_STOPWORDS)]
+    return " ".join(tokens)
+
+def eq_norm(a: str, b: str) -> bool:
+    return (a or "").strip().casefold() == (b or "").strip().casefold()
+
+def _ngrams(s: str, n: int = 3) -> Set[str]:
+    s = _collapse_spaces(s)
+    if len(s) < n:
+        return {s} if s else set()
+    return {s[i:i+n] for i in range(len(s)-n+1)}
+
+def sim_trigram(a: str, b: str) -> float:
+    A, B = _ngrams(a, 3), _ngrams(b, 3)
+    if not A or not B:
+        return 0.0
+    inter = len(A & B)
+    union = len(A | B)
+    return inter / union if union else 0.0
+
+def sim_levenshtein(a: str, b: str) -> float:
+    # normalized Levenshtein similarity (0..1)
+    a, b = a or "", b or ""
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    la, lb = len(a), len(b)
+    dp = list(range(lb + 1))
+    for i in range(1, la + 1):
+        prev = dp[0]
+        dp[0] = i
+        ca = a[i - 1]
+        for j in range(1, lb + 1):
+            cost = 0 if ca == b[j - 1] else 1
+            cur = min(
+                dp[j] + 1,        # deletion
+                dp[j - 1] + 1,    # insertion
+                prev + cost       # substitution
+            )
+            prev, dp[j] = dp[j], cur
+    dist = dp[lb]
+    max_len = max(la, lb)
+    return 1.0 - (dist / max_len)
+
+def sim_token_set(a: str, b: str) -> float:
+    ta = set([t for t in (_collapse_spaces(a).split(" ")) if t])
+    tb = set([t for t in (_collapse_spaces(b).split(" ")) if t])
+    if not ta or not tb:
+        return 0.0
+    inter = len(ta & tb)
+    union = len(ta | tb)
+    return inter / union if union else 0.0
+
+# very compact Kölner Phonetik (sufficient for rough calls)
+def phonetic_koelner(s: str) -> str:
+    s = (s or "").lower()
+    s = _german_umlaut_norm(s, {"umlaute": "ae_oe_ue", "eszett": "ss"})
+    s = re.sub(r"[^a-z]", "", s)
+    if not s:
+        return ""
+
+    # mapping as per simplified Kölner Phonetik
+    def code_char(ch: str, prev: str, nxt: str) -> str:
+        if ch in "aeiouyj":
+            return "0"
+        if ch == "h":
+            return ""
+        if ch == "b":
+            return "1"
+        if ch in "p":
+            return "1" if nxt != "h" else "3"
+        if ch in "d,t":
+            return "2"
+        if ch in "f,v,w":
+            return "3"
+        if ch == "p" and nxt == "h":
+            return "3"
+        if ch in "g,k,q":
+            return "4"
+        if ch == "x":
+            return "48"
+        if ch in "c":
+            # simple variant
+            return "4"
+        if ch in "s,z,ß":
+            return "8"
+        if ch in "l":
+            return "5"
+        if ch in "m,n":
+            return "6"
+        if ch in "r":
+            return "7"
+        return ""
+
+    out: List[str] = []
+    for i, ch in enumerate(s):
+        prev = s[i - 1] if i > 0 else ""
+        nxt = s[i + 1] if i + 1 < len(s) else ""
+        out.append(code_char(ch, prev, nxt))
+    # remove consecutive duplicates
+    dedup: List[str] = []
+    for c in out:
+        if not dedup or c != dedup[-1]:
+            dedup.append(c)
+    return "".join(dedup)
+
+def extract_email_domain(email: str) -> str:
+    m = re.search(r"@([A-Za-z0-9\.\-]+)$", (email or "").strip())
+    return (m.group(1) or "").casefold() if m else ""
+
+
+# -----------------------------------------------------------------------------
+# Customer verification + service order tools
+# -----------------------------------------------------------------------------
 
 @function_tool
 async def verify_customer(
@@ -521,6 +713,242 @@ async def submit_service_order(
 
 
 # -----------------------------------------------------------------------------
+# NEW TOOL: search_customers  (fuzzy, privacy-first, no candidate enumeration)
+# -----------------------------------------------------------------------------
+
+def _norm_digits(s: str) -> str:
+    return re.sub(r"\D", "", s or "")
+
+def _candidate_field(row: Dict[str, str], keys: List[str]) -> str:
+    for k in keys:
+        if k in row and row.get(k):
+            return row.get(k, "")
+    return ""
+
+def _compute_feature_scores(
+    name_q: str, ort_q: str, plz_q: str, street_prefix_q: str, domain_q: str, phone_q: str,
+    row: Dict[str, str],
+    norm_cfg: Dict[str, Any],
+) -> Dict[str, float]:
+    # extract row fields w/ flexible schema
+    name_r_raw = _candidate_field(row, ["firmenname", "firma", "name", "organisation", "organisation2"])
+    ort_r_raw  = _candidate_field(row, ["standort", "ort", "city", "stadt"])
+    plz_r_raw  = _candidate_field(row, ["plz", "postalcode", "zip"])
+    addr_r_raw = _candidate_field(row, ["adresse", "address", "straße", "strasse", "str"])
+    email_r    = _candidate_field(row, ["email", "e-mail", "email1", "e_mail", "mail"])
+    phone_r    = _candidate_field(row, ["phone", "telefon", "telefon büro", "telefon mobil", "telefon privat", "tel"])
+
+    name_r = normalize_text(name_r_raw, norm_cfg)
+    ort_r  = normalize_text(ort_r_raw, norm_cfg)
+    addr_r = normalize_text(addr_r_raw, norm_cfg)
+    plz_r  = _norm_digits(plz_r_raw)
+    domain_r = extract_email_domain(email_r)
+    phone_r_norm = re.sub(r"[^\d\+]", "", phone_r or "")
+
+    # name similarity (mix char + token; phonetic as booster)
+    name_char = max(sim_trigram(name_q, name_r), sim_levenshtein(name_q, name_r))
+    name_tok  = sim_token_set(name_q, name_r)
+    name_sim  = max(name_char, name_tok)
+    if name_q and name_r and phonetic_koelner(name_q) == phonetic_koelner(name_r):
+        name_sim = max(name_sim, 0.95)
+
+    # ort similarity (char + phonetic)
+    ort_char = max(sim_trigram(ort_q, ort_r), sim_levenshtein(ort_q, ort_r))
+    ort_sim  = ort_char
+    if ort_q and ort_r and phonetic_koelner(ort_q) == phonetic_koelner(ort_r):
+        ort_sim = max(ort_sim, 0.95)
+
+    # plz
+    plz_match = 1.0 if plz_q and plz_r and plz_q == plz_r else 0.0
+
+    # address (prefix-focused)
+    addr_sim = 0.0
+    if street_prefix_q and addr_r:
+        if addr_r.startswith(street_prefix_q):
+            addr_sim = 0.8
+        else:
+            addr_sim = 0.6 * sim_trigram(street_prefix_q, addr_r)
+
+    # phone, email domain
+    phone_match = 1.0 if phone_q and phone_r_norm and phone_q == phone_r_norm else 0.0
+    email_domain_match = 1.0 if domain_q and domain_r and domain_q == domain_r else 0.0
+
+    return {
+        "name": float(name_sim),
+        "ort": float(ort_sim),
+        "plz": float(plz_match),
+        "addr": float(addr_sim),
+        "phone": float(phone_match),
+        "email_domain": float(email_domain_match),
+    }
+
+def _weighted_score(features: Dict[str, float], weights: Dict[str, float]) -> float:
+    score = 0.0
+    total_w = 0.0
+    for k, v in features.items():
+        w = float(weights.get(k, 0.0))
+        score += v * w
+        total_w += w
+    return (score / total_w) if total_w > 0 else 0.0
+
+def _coverage_ok(features: Dict[str, float]) -> bool:
+    positives = 0
+    # define "independent positive" per feature
+    if features.get("name", 0.0) >= 0.80: positives += 1
+    if features.get("ort", 0.0)  >= 0.80: positives += 1
+    if features.get("plz", 0.0)  >= 1.00: positives += 1
+    if features.get("addr", 0.0) >= 0.60: positives += 1
+    if features.get("phone", 0.0) >= 1.00: positives += 1
+    if features.get("email_domain", 0.0) >= 1.00: positives += 1
+    return positives >= 2
+
+def _conflict_penalty(features: Dict[str, float], plz_q: str, ort_q: str) -> float:
+    penalty = 0.0
+    # If name is high but PLZ absent or contradictory and ort low -> penalize slightly
+    if features.get("name", 0.0) >= 0.85 and features.get("plz", 0.0) < 1.0 and features.get("ort", 0.0) < 0.60:
+        penalty += 0.05
+    # Known mismatch: user provided PLZ but ort similarity is very low
+    if plz_q and features.get("plz", 0.0) < 1.0 and ort_q and features.get("ort", 0.0) < 0.40:
+        penalty += 0.10
+    return penalty
+
+def _choose_ask_next(order: List[str], provided: Dict[str, str], asked: List[str], features: Dict[str, float]) -> str:
+    already = set(asked or [])
+    for feat in order:
+        if feat in already:
+            continue
+        # ask for the most informative missing/weak feature
+        if feat == "plz" and not provided.get("plz"):
+            return "plz"
+        if feat == "ort" and not provided.get("ort"):
+            return "ort"
+        if feat == "email_domain" and not provided.get("email_domain"):
+            return "email_domain"
+        if feat == "strassen_prefix" and not provided.get("street_prefix"):
+            return "strassen_prefix"
+    # fallback: ask for the weakest (if any)
+    weakest = min(features.items(), key=lambda kv: kv[1])[0] if features else ""
+    mapping = {"email_domain": "email_domain", "addr": "strassen_prefix"}
+    return mapping.get(weakest, "")
+
+@function_tool
+async def search_customers(
+    context: RunContext,
+    firmenname: str = "",
+    ort: str = "",
+    plz: str = "",
+    email: str = "",
+    phone_e164: str = "",
+    street_prefix: str = "",
+) -> Dict[str, Any]:
+    """
+    Interne fuzzy Kandidatensuche OHNE Kandidatennennung nach außen.
+    Rückgabe steuert Dialog: (decision, ask_next) und False-Positive-Guard via score/coverage.
+    """
+    artifacts: SessionArtifacts = context.userdata
+    cfg = artifacts.config or {}
+    cv_cfg = (cfg.get("customer_verification") or {}) if isinstance(cfg, dict) else {}
+    fuzzy_cfg = (cv_cfg.get("fuzzy") or {}) if isinstance(cv_cfg, dict) else {}
+
+    # defaults (fallback-first)
+    thresholds = (fuzzy_cfg.get("thresholds") or {"allow": 0.86, "ask": 0.72, "block": 0.50})
+    weights = (fuzzy_cfg.get("weights") or {"name": 0.40, "ort": 0.25, "plz": 0.20, "addr": 0.05, "phone": 0.10, "email_domain": 0.10})
+    norm_cfg = (fuzzy_cfg.get("normalization") or {"umlaute": "ae_oe_ue", "eszett": "ss", "punct": "drop", "spaces": "collapse"})
+    disamb = (fuzzy_cfg.get("disambiguation") or {"max_turns": 2, "order": ["plz", "ort", "email_domain", "strassen_prefix"]})
+    max_k = int(fuzzy_cfg.get("max_candidates_internal", 5) or 5)
+
+    # normalize inputs
+    name_q = normalize_text(firmenname, norm_cfg)
+    ort_q = normalize_text(ort, norm_cfg)
+    plz_q = _norm_digits(plz)
+    domain_q = extract_email_domain(email)
+    phone_q = re.sub(r"[^\d\+]", "", phone_e164 or "")
+    street_prefix_q = normalize_text(street_prefix, norm_cfg)
+
+    provided = {
+        "name": name_q,
+        "ort": ort_q,
+        "plz": plz_q,
+        "email_domain": domain_q,
+        "phone": phone_q,
+        "street_prefix": street_prefix_q,
+    }
+
+    # compute features + scores over all customers
+    scored: List[Tuple[str, float, Dict[str, float]]] = []
+    for row in artifacts.customers or []:
+        cid = (row.get("customer_id") or "").strip()
+        if not cid:
+            continue
+        feats = _compute_feature_scores(name_q, ort_q, plz_q, street_prefix_q, domain_q, phone_q, row, norm_cfg)
+        score_base = _weighted_score(feats, weights)
+        penalty = _conflict_penalty(feats, plz_q, ort_q)
+        score = max(0.0, score_base - penalty)
+        scored.append((cid, score, feats))
+
+    # shortlist
+    scored.sort(key=lambda t: t[1], reverse=True)
+    shortlist = scored[:max_k] if max_k > 0 else scored
+    best_cid, best_score, best_feats = (shortlist[0] if shortlist else ("", 0.0, {}))
+
+    cov_ok = _coverage_ok(best_feats) if shortlist else False
+
+    # decision
+    allow_th = float(thresholds.get("allow", 0.86))
+    ask_th = float(thresholds.get("ask", 0.72))
+    # block_th not explicitly needed here; everything < ask_th is effectively "block"
+
+    if best_score >= allow_th and cov_ok:
+        decision = "allow"
+        ask_next = ""
+    elif best_score >= ask_th:
+        decision = "ask"
+        order = list((disamb.get("order") or ["plz", "ort", "email_domain", "strassen_prefix"]))
+        ask_next = _choose_ask_next(order, provided, artifacts.fz_asked, best_feats)
+    else:
+        decision = "block"
+        ask_next = _choose_ask_next(list((disamb.get("order") or [])), provided, artifacts.fz_asked, best_feats)
+
+    # update artifacts (maskierte Diagnostik)
+    artifacts.fz_decision = decision
+    artifacts.fz_score = float(best_score)
+    artifacts.fz_coverage_ok = bool(cov_ok)
+    artifacts.fz_features = {
+        "name": float(best_feats.get("name", 0.0)),
+        "ort": float(best_feats.get("ort", 0.0)),
+        "plz": float(best_feats.get("plz", 0.0)),
+        "addr": float(best_feats.get("addr", 0.0)),
+        "phone": float(best_feats.get("phone", 0.0)),
+        "email_domain": float(best_feats.get("email_domain", 0.0)),
+    }
+
+    # track which features were provided this turn (approximates "asked features")
+    newly_provided: List[str] = []
+    if plz_q: newly_provided.append("plz")
+    if ort_q: newly_provided.append("ort")
+    if domain_q: newly_provided.append("email_domain")
+    if street_prefix_q: newly_provided.append("strassen_prefix")
+    if newly_provided:
+        # maintain uniqueness while preserving order
+        seen = set(artifacts.fz_asked)
+        for x in newly_provided:
+            if x not in seen:
+                artifacts.fz_asked.append(x)
+                seen.add(x)
+
+    return {
+        "ok": True,
+        "decision": decision,
+        "score": float(best_score),
+        "coverage_ok": bool(cov_ok),
+        "best_candidate_customer_id": best_cid,  # INTERNAL ONLY; never speak this
+        "ask_next": ask_next,
+        "features": artifacts.fz_features,
+        "privacy": {"enumerated": False},
+    }
+
+
+# -----------------------------------------------------------------------------
 # Transcript helpers
 # -----------------------------------------------------------------------------
 
@@ -528,10 +956,8 @@ def _safe_calls_prefix(prefix: str) -> str:
     p = (prefix or "").strip() or "calls/"
     return p if p.endswith("/") else (p + "/")
 
-
 def _safe_blob_name(name: str) -> str:
     return (name or "").replace("/", "_").replace("\\", "_").strip() or "unknown"
-
 
 def _history_to_transcript(session: AgentSession) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
@@ -673,8 +1099,39 @@ async def entrypoint(ctx: JobContext):
     if not isinstance(stt_langs, list):
         stt_langs = ["de-AT", "de-DE"]
 
+    # Build optional phrase hints from customers (firmenname + standort)
+    phrase_hints: List[str] = []
     try:
-        stt = azure_speech.STT(language=stt_langs)
+        fuzzy_cfg = (cv_cfg.get("fuzzy") or {}) if isinstance(cv_cfg, dict) else {}
+        use_hints = bool((fuzzy_cfg.get("stt") or {}).get("phrase_hints", "") == "from_csv")
+        if use_hints and customers:
+            seen: Set[str] = set()
+            for r in customers:
+                for k in ("firmenname", "standort", "ort", "city"):
+                    v = (r.get(k) or "").strip()
+                    if not v:
+                        continue
+                    if v in seen:
+                        continue
+                    seen.add(v)
+                    phrase_hints.append(v)
+                    if len(phrase_hints) >= 500:
+                        break
+                if len(phrase_hints) >= 500:
+                    break
+    except Exception:
+        logger.debug("Failed to build phrase hints (continuing).", exc_info=True)
+
+    # Instantiate STT with optional hints (fallback if not supported)
+    try:
+        if phrase_hints:
+            try:
+                stt = azure_speech.STT(language=stt_langs, hints=phrase_hints)  # type: ignore[call-arg]
+            except TypeError:
+                # older versions may not support 'hints'
+                stt = azure_speech.STT(language=stt_langs)
+        else:
+            stt = azure_speech.STT(language=stt_langs)
     except Exception:
         logger.warning("azure_speech.STT(language=...) failed; falling back to default STT().", exc_info=True)
         stt = azure_speech.STT()
@@ -747,11 +1204,28 @@ async def entrypoint(ctx: JobContext):
         "- Nach erfolgreicher Verifikation: Serviceauftrag strukturiert aufnehmen und submit_service_order verwenden.\n"
     )
 
-    instructions = (str(base_prompt).strip() + runtime_rules).strip()
+    # Fuzzy addendum (privacy-first) — enabled by default (fallback-first)
+    fuzzy_cfg = (cv_cfg or {}).get("fuzzy", {}) if isinstance(cv_cfg, dict) else {}
+    fuzzy_enabled = bool((fuzzy_cfg or {}).get("enabled", True))
+    fuzzy_rules = ""
+    if fuzzy_enabled:
+        fuzzy_rules = (
+            "\n\n"
+            "Fuzzy-Suche & Datenschutz (verbindlich):\n"
+            "- Nutze zuerst search_customers zur internen Kandidatensuche.\n"
+            "- Nenne niemals Kandidaten, Adressen oder PLZ aus dem System.\n"
+            "- Stelle genau eine Frage pro Turn: PLZ, Ort, E-Mail-Domain oder Straßen-Prefix.\n"
+            "- Verifiziere nur, wenn decision=allow und coverage_ok=true. Sonst eine Zusatzfrage oder Eskalation.\n"
+            "- Gib niemals customer_id oder interne Systemdaten an den Anrufer weiter.\n"
+            "- Bestätige maskiert (z. B. 'Beginnt Ihre PLZ mit 50…?').\n"
+            "- Biete Buchstabieren an, wenn unklar.\n"
+        )
+
+    instructions = (str(base_prompt).strip() + runtime_rules + fuzzy_rules).strip()
 
     agent = Agent(
         instructions=instructions,
-        tools=[verify_customer, submit_service_order],
+        tools=[verify_customer, submit_service_order, search_customers] if fuzzy_enabled else [verify_customer, submit_service_order],
     )
 
     # ---------------------------------------------------------------
@@ -772,6 +1246,20 @@ async def entrypoint(ctx: JobContext):
             "transcript": transcript,
             "summary": artifacts.summary,
         }
+
+        # Add masked fuzzy diagnostics (no PII)
+        try:
+            payload["fuzzy_diagnostics"] = {
+                "enabled": bool(fuzzy_enabled),
+                "decision": artifacts.fz_decision,
+                "score": artifacts.fz_score,
+                "coverage_ok": artifacts.fz_coverage_ok,
+                "features": artifacts.fz_features,
+                "asked_features": artifacts.fz_asked,
+                "privacy": {"no_candidate_enumeration": True},
+            }
+        except Exception:
+            logger.debug("Adding fuzzy diagnostics failed (continuing).", exc_info=True)
 
         # 1) write to blob
         try:
@@ -845,6 +1333,7 @@ async def entrypoint(ctx: JobContext):
     # ---------------------------------------------------------------
     await session.start(agent=agent, room=ctx.room)
 
+    # Prefer configured welcome; otherwise fallback-first text already in defaults
     welcome = (agent_cfg or {}).get(
         "welcome_message",
         _default_config()["agent"]["welcome_message"],
