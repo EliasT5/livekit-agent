@@ -1179,6 +1179,13 @@ async def entrypoint(ctx: JobContext):
     # Instructions (dashboard uses agent.system_prompt)
     # ---------------------------------------------------------------
     base_prompt = (
+        """
+        Suche im CSV File und liefere den wahrscheinlichen Kundennamen als Antwort retour. Prüfe auch phonetisch.
+        Liefere das JSON Schema retour.  Beispiel: {
+        "kundenname": "Anna Schmidt"
+        }. Liefere nur das JSON als Antwort ohne Einleitungstext
+        """ 
+        +
         (agent_cfg or {}).get("system_prompt")
         or (agent_cfg or {}).get("instructions")
         or (agent_cfg or {}).get("prompt")
@@ -1343,3 +1350,4 @@ async def entrypoint(ctx: JobContext):
 
 if __name__ == "__main__":
     cli.run_app(server)
+
