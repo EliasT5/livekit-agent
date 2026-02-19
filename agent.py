@@ -511,7 +511,10 @@ async def verify_customer(
     elif firmenname_in:
         row = next(
             (r for r in artifacts.customers
-             if any(_fuzzy_match(firmenname_in, (v or "").strip()) for v in r.values())),
+             if _fuzzy_match(
+                 firmenname_in,
+                 next((v for k, v in r.items() if k.lower() == "firmenname"), "").strip(),
+             )),
             None,
         )
         if not row:
