@@ -148,8 +148,8 @@ def _default_config() -> Dict[str, Any]:
         "agent": {
             "system_prompt": (
                 "Du bist ein deutscher Telefon-Serviceassistent.\n"
-                "Ablauf: Begrüßen -> Kundennummer + Name des Anrufers + (Firmenname oder Standort) abfragen -> "
-                "per Tool verifizieren -> Serviceauftrag aufnehmen -> am Ende kurz zusammenfassen.\n"
+                "Ablauf: Begrüßen -> Kundennummer fragen; falls nicht vorhanden: Firmennamen fragen -> "
+                "Name des Anrufers fragen -> per Tool verifizieren -> Serviceauftrag aufnehmen -> kurz zusammenfassen.\n"
                 "Regeln: Keine Emojis. Kurze Sätze. Immer eine Frage auf einmal."
             ),
             "welcome_message": "Willkommen beim Service. Bitte nennen Sie mir Ihre Kundennummer.",
@@ -474,17 +474,15 @@ def _fuzzy_match(input_name: str, csv_name: str, threshold: int = 75) -> bool:
 @function_tool
 async def verify_customer(
     context: RunContext,
-    customer_id: str,
+    customer_id: str = "",
     caller_name: str = "",
     firmenname: str = "",
-    standort: str = "",
 ) -> Dict[str, Any]:
     """
     Verifiziert Kunden gegen customers.csv aus Blob.
-    Verwendet config.customer_verification:
-      - ask_caller_name (bool)
-      - max_attempts (int)
-      - match_policy: firm_or_site | firm_and_site
+    Pfad 1: customer_id (exakt) → sofort verifiziert.
+    Pfad 2: firmenname (fuzzy) → sucht über alle Zeilen.
+    Konfiguration: ask_caller_name (bool), max_attempts (int).
     """
     artifacts: SessionArtifacts = context.userdata
     artifacts.verification_attempts += 1
@@ -497,41 +495,34 @@ async def verify_customer(
             "reason": f"Maximale Verifikationsversuche erreicht ({max_attempts}).",
         }
 
-    customer_id = (customer_id or "").strip()
-    if not customer_id:
-        return {"ok": False, "reason": "Kundennummer fehlt."}
+    customer_id   = (customer_id or "").strip()
+    firmenname_in = (firmenname  or "").strip()
 
-    row = next((r for r in artifacts.customers if (r.get("customer_id") or "").strip() == customer_id), None)
-    if not row:
-        return {"ok": False, "reason": "Kundennummer nicht gefunden."}
+    # Path 1: lookup by customer ID (exact)
+    if customer_id:
+        row = next(
+            (r for r in artifacts.customers
+             if (r.get("customer_id") or "").strip() == customer_id),
+            None,
+        )
+        if not row:
+            return {"ok": False, "reason": "Kundennummer nicht gefunden."}
+    # Path 2: lookup by company name (fuzzy)
+    elif firmenname_in:
+        row = next(
+            (r for r in artifacts.customers
+             if _fuzzy_match(firmenname_in, (r.get("firmenname", "") or "").strip())),
+            None,
+        )
+        if not row:
+            return {"ok": False, "reason": "Firmenname nicht gefunden."}
+    else:
+        return {"ok": False, "reason": "Bitte nennen Sie Ihre Kundennummer oder Ihren Firmennamen."}
 
     ask_name = bool(_get_cfg(artifacts, "customer_verification", "ask_caller_name", default=True))
     caller_name = (caller_name or "").strip()
     if ask_name and not caller_name:
         return {"ok": False, "reason": "Name des Anrufers fehlt."}
-
-    policy = str(_get_cfg(artifacts, "customer_verification", "match_policy", default="firm_or_site") or "firm_or_site").strip()
-
-    firmenname_in = (firmenname or "").strip()
-    standort_in = (standort or "").strip()
-
-    csv_firmenname = (row.get("firmenname", "") or "").strip()
-    csv_standort   = (row.get("standort",   "") or "").strip()
-
-    firm_ok = bool(firmenname_in and _fuzzy_match(firmenname_in, csv_firmenname))
-    site_ok = bool(standort_in   and _fuzzy_match(standort_in,   csv_standort))
-
-    if policy == "firm_and_site":
-        if not (firmenname_in and standort_in):
-            return {"ok": False, "reason": "Für die Verifikation brauche ich Firmenname UND Standort."}
-        if not (firm_ok and site_ok):
-            return {"ok": False, "reason": "Firmenname oder Standort stimmt nicht überein."}
-    else:
-        # default: firm_or_site
-        if not (firmenname_in or standort_in):
-            return {"ok": False, "reason": "Bitte nennen Sie Firmenname oder Standort."}
-        if not (firm_ok or site_ok):
-            return {"ok": False, "reason": "Firmenname oder Standort stimmt nicht überein."}
 
     vc = VerifiedCustomer(
         customer_id=row.get("customer_id", "") or "",
@@ -790,14 +781,12 @@ async def entrypoint(ctx: JobContext):
     # Hard runtime constraints from config (so the agent behaves as configured)
     ask_name = bool((cv_cfg or {}).get("ask_caller_name", True))
     max_attempts = int((cv_cfg or {}).get("max_attempts", 3) or 3)
-    match_policy = str((cv_cfg or {}).get("match_policy", "firm_or_site") or "firm_or_site")
 
     runtime_rules = (
         "\n\n"
         "Laufende Konfiguration (muss eingehalten werden):\n"
         f"- Name des Anrufers abfragen: {'ja' if ask_name else 'nein'}\n"
         f"- Max. Verifikationsversuche: {max_attempts}\n"
-        f"- Match Policy: {match_policy}\n"
         "Regeln:\n"
         "- Sprich immer deutsch.\n"
         "- Kurze Sätze. Keine Emojis.\n"
