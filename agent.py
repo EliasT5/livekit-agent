@@ -410,65 +410,6 @@ def _get_cfg(artifacts: SessionArtifacts, *path: str, default: Any = None) -> An
     return default if cur is None else cur
 
 
-_CORPORATE_SUFFIX_PATTERNS: list[tuple[str, str]] = [
-    # Full spoken form
-    (r"\bgesellschaft\s+mit\s+beschr[aä]nkter\s+haftung\b", ""),
-    # STT variants of "GmbH"
-    (r"\bgeh\s+m\s+b\s+h\b",    ""),
-    (r"\bge\s+em\s+be\s+ha\b",  ""),
-    (r"\bges\s+m\s+b\s+h\b",    ""),
-    (r"\bgmbh\b",                ""),
-    # AG variants
-    (r"\baktiengesellschaft\b",  ""),
-    (r"\ba\s+g\b",               ""),
-    (r"\bag\b",                  ""),
-    # KG / OG
-    (r"\bk\s+g\b",               ""),
-    (r"\bkg\b",                  ""),
-    (r"\bo\s+g\b",               ""),
-    (r"\bog\b",                  ""),
-    # & Co. KG variants
-    (r"&\s*co\.?\s*kg\b",        ""),
-    (r"\bund\s+co\.?\s*kg\b",    ""),
-    # Dots (e.g. "A.G.")
-    (r"\.",                      " "),
-]
-
-_SUFFIX_RE = [
-    (re.compile(pat, re.IGNORECASE), repl)
-    for pat, repl in _CORPORATE_SUFFIX_PATTERNS
-]
-
-
-def _normalize_company(name: str) -> str:
-    text = (name or "").lower()
-    for pattern, replacement in _SUFFIX_RE:
-        text = pattern.sub(replacement, text)
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def _fuzzy_match(input_name: str, csv_name: str, threshold: int = 75) -> bool:
-    from rapidfuzz import fuzz
-
-    norm_input = _normalize_company(input_name)
-    norm_csv   = _normalize_company(csv_name)
-
-    if not norm_input:
-        return False
-
-    # Stage 1: exact match after normalization
-    if norm_input == norm_csv:
-        return True
-
-    # Stage 2: partial_ratio — "red bull" ⊂ "red bull vienna branch"
-    if fuzz.partial_ratio(norm_input, norm_csv) >= threshold:
-        return True
-
-    # Stage 3: token_sort_ratio — STT phonetic artefacts ("hahn sie" ≈ "hansi")
-    if fuzz.token_sort_ratio(norm_input, norm_csv) >= threshold:
-        return True
-
-    return False
 
 
 @function_tool
@@ -507,14 +448,13 @@ async def verify_customer(
         )
         if not row:
             return {"ok": False, "reason": "Kundennummer nicht gefunden."}
-    # Path 2: lookup by company name (fuzzy match against any cell value)
+    # Path 2: exact case-insensitive lookup on firmenname column
+    # (AI resolves ambiguity before calling this tool and passes the exact CSV value)
     elif firmenname_in:
         row = next(
             (r for r in artifacts.customers
-             if _fuzzy_match(
-                 firmenname_in,
-                 next((v for k, v in r.items() if k.lower() == "firmenname"), "").strip(),
-             )),
+             if next((v for k, v in r.items() if k.lower() == "firmenname"), "").strip().lower()
+             == firmenname_in.lower()),
             None,
         )
         if not row:
@@ -802,6 +742,7 @@ async def entrypoint(ctx: JobContext):
         "- Sprich immer deutsch.\n"
         "- Kurze Sätze. Keine Emojis.\n"
         "- Verifiziere den Kunden IMMER über das Tool verify_customer.\n"
+        "- Wenn ein Anrufer seinen Firmennamen nennt: vergleiche ihn mit der 'firmenname'-Spalte der Kundenliste, wähle den ähnlichsten Eintrag und übergib diesen exakten Wert (wie in der CSV) an verify_customer.\n"
         "- Wenn locked=true zurückkommt: freundlich abbrechen oder an menschlichen Support verweisen.\n"
         "- Nach erfolgreicher Verifikation: Serviceauftrag strukturiert aufnehmen und submit_service_order verwenden.\n"
     )
