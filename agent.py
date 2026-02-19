@@ -795,7 +795,19 @@ async def entrypoint(ctx: JobContext):
         "- Nach erfolgreicher Verifikation: Serviceauftrag strukturiert aufnehmen und submit_service_order verwenden.\n"
     )
 
-    instructions = (str(base_prompt).strip() + runtime_rules).strip()
+    if artifacts.customers:
+        _customers_json = json.dumps(artifacts.customers, ensure_ascii=False)
+        customers_block = (
+            "\n\nKundenliste (aus customers.csv) – für Verifikation verwenden:\n"
+            f"{_customers_json}"
+        )
+    else:
+        customers_block = (
+            "\n\nKundenliste: LEER – CSV wurde nicht geladen. "
+            "Weise den Anrufer freundlich darauf hin."
+        )
+
+    instructions = (str(base_prompt).strip() + runtime_rules + customers_block).strip()
 
     agent = Agent(
         instructions=instructions,
