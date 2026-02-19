@@ -215,6 +215,7 @@ class ServiceOrder:
 class SessionArtifacts:
     config: Dict[str, Any] = field(default_factory=dict)
     customers: List[Dict[str, str]] = field(default_factory=list)
+    customers_raw: str = ""
 
     verified_customer: Optional[VerifiedCustomer] = None
     service_order: Optional[ServiceOrder] = None
@@ -261,14 +262,13 @@ def load_json_blob(path: str) -> Dict[str, Any]:
     return json.loads(data)
 
 
-def load_csv_blob(path: str) -> List[Dict[str, str]]:
+def load_csv_blob(path: str) -> tuple[str, List[Dict[str, str]]]:
     raw = _blob_client(path).download_blob().readall().decode("utf-8-sig")
     rows = list(csv.DictReader(io.StringIO(raw)))
-    # normalize whitespace
     out: List[Dict[str, str]] = []
     for r in rows:
         out.append({k: (v or "").strip() for k, v in r.items()})
-    return out
+    return raw.strip(), out
 
 
 def write_json_blob(path: str, payload: Dict[str, Any]) -> None:
@@ -498,20 +498,20 @@ async def verify_customer(
     customer_id   = (customer_id or "").strip()
     firmenname_in = (firmenname  or "").strip()
 
-    # Path 1: lookup by customer ID (exact)
+    # Path 1: lookup by customer ID (exact match against any cell value)
     if customer_id:
         row = next(
             (r for r in artifacts.customers
-             if (r.get("customer_id") or "").strip() == customer_id),
+             if any((v or "").strip() == customer_id for v in r.values())),
             None,
         )
         if not row:
             return {"ok": False, "reason": "Kundennummer nicht gefunden."}
-    # Path 2: lookup by company name (fuzzy)
+    # Path 2: lookup by company name (fuzzy match against any cell value)
     elif firmenname_in:
         row = next(
             (r for r in artifacts.customers
-             if _fuzzy_match(firmenname_in, (r.get("firmenname", "") or "").strip())),
+             if any(_fuzzy_match(firmenname_in, (v or "").strip()) for v in r.values())),
             None,
         )
         if not row:
@@ -524,12 +524,19 @@ async def verify_customer(
     if ask_name and not caller_name:
         return {"ok": False, "reason": "Name des Anrufers fehlt."}
 
+    row_lc = {k.lower(): v for k, v in row.items()}
     vc = VerifiedCustomer(
-        customer_id=row.get("customer_id", "") or "",
-        firmenname=row.get("firmenname", "") or "",
-        standort=row.get("standort", "") or "",
-        adresse=row.get("adresse", "") or "",
-        country=row.get("country", "") or "",
+        customer_id=(
+            row_lc.get("customer_id") or row_lc.get("kundennummer") or row_lc.get("id") or customer_id or ""
+        ),
+        firmenname=(
+            row_lc.get("firmenname") or row_lc.get("firma") or row_lc.get("company") or row_lc.get("name") or ""
+        ),
+        standort=(
+            row_lc.get("standort") or row_lc.get("ort") or row_lc.get("location") or row_lc.get("site") or ""
+        ),
+        adresse=row_lc.get("adresse") or row_lc.get("address") or "",
+        country=row_lc.get("country") or row_lc.get("land") or "",
         caller_name=caller_name or "",
     )
     artifacts.verified_customer = vc
@@ -659,10 +666,10 @@ async def entrypoint(ctx: JobContext):
     calls_prefix = (storage_cfg.get("calls_prefix") or CALLS_PREFIX) if isinstance(storage_cfg, dict) else CALLS_PREFIX
 
     try:
-        customers = await asyncio.to_thread(load_csv_blob, customers_blob)
+        customers_raw, customers = await asyncio.to_thread(load_csv_blob, customers_blob)
     except Exception:
         logger.exception("Failed to load customers CSV from blob=%s (continuing with empty list).", customers_blob)
-        customers = []
+        customers_raw, customers = "", []
 
     # Robust call_id
     job_obj = getattr(ctx, "job", None)
@@ -678,6 +685,7 @@ async def entrypoint(ctx: JobContext):
     artifacts = SessionArtifacts(
         config=cfg,
         customers=customers,
+        customers_raw=customers_raw,
         caller_number=caller_number or getattr(ctx.room, "name", "") or None,
         call_id=call_id,
     )
@@ -795,11 +803,10 @@ async def entrypoint(ctx: JobContext):
         "- Nach erfolgreicher Verifikation: Serviceauftrag strukturiert aufnehmen und submit_service_order verwenden.\n"
     )
 
-    if artifacts.customers:
-        _customers_json = json.dumps(artifacts.customers, ensure_ascii=False)
+    if artifacts.customers_raw:
         customers_block = (
-            "\n\nKundenliste (aus customers.csv) – für Verifikation verwenden:\n"
-            f"{_customers_json}"
+            "\n\nKundenliste (rohe CSV-Daten) – für Verifikation verwenden:\n"
+            f"{artifacts.customers_raw}"
         )
     else:
         customers_block = (
