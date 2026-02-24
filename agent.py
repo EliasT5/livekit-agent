@@ -222,7 +222,7 @@ def _default_config() -> Dict[str, Any]:
             "endpoint": "",
             "api_key": "",
             "deployment": "gpt-5-mini",
-            "api_version": "2025-01-01-preview",
+            "api_version": "2024-12-01-preview",
         },
         "azure_speech": {
             "key": "",
