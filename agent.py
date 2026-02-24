@@ -202,6 +202,9 @@ class SessionArtifacts:
     fz_features: Dict[str, float] = field(default_factory=dict)
     fz_asked: List[str] = field(default_factory=list)
 
+    # Runtime reference — not serialised
+    room: Any = field(default=None, repr=False)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # §5  Default config
@@ -855,6 +858,16 @@ async def submit_service_order(
     return {"ok": True, "order_id": order.order_id}
 
 
+@function_tool
+async def hangup_call(context: RunContext) -> Dict[str, Any]:
+    """Beendet den Anruf, nachdem der Serviceauftrag vollständig erfasst und
+    vom Anrufer mündlich bestätigt wurde."""
+    artifacts: SessionArtifacts = context.userdata
+    if artifacts.room:
+        await artifacts.room.disconnect()
+    return {"ok": True}
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # §10  System prompt builder
 # ═══════════════════════════════════════════════════════════════════════════
@@ -889,7 +902,12 @@ def _build_system_prompt(cfg: Dict[str, Any]) -> str:
             or _default_config()["agent"]["fuzzy_rules"]
         )
 
-    instructions = "\n\n".join(filter(None, [base_prompt, runtime_rules, fuzzy_rules])).strip()
+    hangup_rules = (
+        "Sobald der Anrufer den Serviceauftrag mündlich bestätigt hat, "
+        "verabschiede dich höflich und rufe anschließend das Tool `hangup_call` auf, "
+        "um den Anruf zu beenden."
+    )
+    instructions = "\n\n".join(filter(None, [base_prompt, runtime_rules, fuzzy_rules, hangup_rules])).strip()
     return instructions
 
 
@@ -1176,6 +1194,7 @@ async def entrypoint(ctx: JobContext) -> None:
         caller_number=caller_number,
         call_id=call_id,
     )
+    artifacts.room = ctx.room
 
     # 8. Build STT + TTS (Azure Speech) + LLM (Azure OpenAI chat completions)
     llm_cfg     = cfg.get("llm") or {}
@@ -1221,7 +1240,7 @@ async def entrypoint(ctx: JobContext) -> None:
     fuzzy_cfg = (cv_cfg.get("fuzzy") or {})
 
     fuzzy_enabled = bool(fuzzy_cfg.get("enabled", True))
-    tools = [verify_customer, submit_service_order]
+    tools = [verify_customer, submit_service_order, hangup_call]
     if fuzzy_enabled:
         tools.append(search_customers)
 
