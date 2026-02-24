@@ -114,7 +114,7 @@ _KV_SECRET_MAP: Dict[str, str] = {
     "livekit-url":                            "LIVEKIT_URL",
     "livekit-api-key":                        "LIVEKIT_API_KEY",
     "livekit-api-secret":                     "LIVEKIT_API_SECRET",
-    "communication-connection-string-ema":  "AZURE_COMMUNICATION_CONNECTION_STRING",
+    "communication-connection-string-email": "AZURE_COMMUNICATION_CONNECTION_STRING",
 }
 
 _kv_cache: Dict[str, str] = {}
