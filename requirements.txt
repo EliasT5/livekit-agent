@@ -1,15 +1,8 @@
-# Core
-python-dotenv>=1.0.0
+python-dotenv>=1.2.0
 azure-storage-blob>=12.19.0
-rapidfuzz>=3.6.0
-
-# LiveKit
-livekit-agents>=0.12.0
-livekit-plugins-azure>=0.3.0
-livekit-plugins-openai>=0.3.0
-
-# Optional: turn detector (multilingual model)
-livekit-plugins-turn-detector>=0.3.0
-
-# Optional: Azure Communication Services email
+azure-identity>=1.15.0
+azure-keyvault-secrets>=4.7.0
+livekit-agents>=1.0.0
+livekit-plugins-openai>=1.0.0
+livekit-plugins-azure>=1.0.0
 azure-communication-email>=1.0.0
