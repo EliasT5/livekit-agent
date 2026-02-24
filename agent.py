@@ -106,14 +106,15 @@ _load_dotenv()
 # ═══════════════════════════════════════════════════════════════════════════
 
 _KV_SECRET_MAP: Dict[str, str] = {
-    "AZURE-OPENAI-API-KEY":                   "AZURE_OPENAI_API_KEY",
-    "AZURE-OPENAI-ENDPOINT":                  "AZURE_OPENAI_ENDPOINT",
-    "AZURE-SPEECH-KEY":                       "AZURE_SPEECH_KEY",
-    "AZURE-SPEECH-REGION":                    "AZURE_SPEECH_REGION",
-    "AZURE-STORAGE-CONNECTION-STRING":        "AZURE_STORAGE_CONNECTION_STRING",
-    "LIVEKIT-API-KEY":                        "LIVEKIT_API_KEY",
-    "LIVEKIT-API-SECRET":                     "LIVEKIT_API_SECRET",
-    "AZURE-COMMUNICATION-CONNECTION-STRING":  "AZURE_COMMUNICATION_CONNECTION_STRING",
+    "azure-openai-api-key":                   "AZURE_OPENAI_API_KEY",
+    "azure-openai-endpoint":                  "AZURE_OPENAI_ENDPOINT",
+    "azure-speech-key":                       "AZURE_SPEECH_KEY",
+    "azure-speech-region":                    "AZURE_SPEECH_REGION",
+    "azure-storage-connection-string":        "AZURE_STORAGE_CONNECTION_STRING",
+    "livekit-url":                            "LIVEKIT_URL",
+    "livekit-api-key":                        "LIVEKIT_API_KEY",
+    "livekit-api-secret":                     "LIVEKIT_API_SECRET",
+    "communication-connection-string-ema":  "AZURE_COMMUNICATION_CONNECTION_STRING",
 }
 
 _kv_cache: Dict[str, str] = {}
