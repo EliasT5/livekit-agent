@@ -149,6 +149,10 @@ def _get_secret(env_name: str, fallback: str = "") -> str:
 
 
 _load_keyvault_secrets()
+# Inject KV secrets into os.environ so the LiveKit framework can read them at startup
+# (WorkerOptions reads LIVEKIT_API_KEY/SECRET/URL before entrypoint() is called)
+for _env_name, _val in _kv_cache.items():
+    os.environ.setdefault(_env_name, _val)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # §7  Data models
