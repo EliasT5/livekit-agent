@@ -262,6 +262,7 @@ def _default_config() -> Dict[str, Any]:
         "speech": {
             "tts_voice": "de-DE-ConradNeural",
             "language": "de-DE",
+            "stt_language": "de-DE",
         },
         "turn": {
             "preset": "very_patient",
@@ -331,6 +332,9 @@ def _default_config() -> Dict[str, Any]:
             "customers_csv_blob": "data/customers.csv",
             "calls_prefix": "calls/",
         },
+        "customization": {
+            "app_name": "phone-agent",
+        },
         "llm": {
             "temperature": 0.2,
         },
@@ -391,10 +395,10 @@ def load_config() -> Dict[str, Any]:
     return _deep_merge(defaults, blob_cfg)
 
 
-def load_customers() -> List[Dict[str, str]]:
-    raw = load_blob_text(CUSTOMERS_BLOB)
+def load_customers(blob_path: str = CUSTOMERS_BLOB) -> List[Dict[str, str]]:
+    raw = load_blob_text(blob_path)
     if not raw.strip():
-        logger.warning("Customer CSV is empty or missing: %s", CUSTOMERS_BLOB)
+        logger.warning("Customer CSV is empty or missing: %s", blob_path)
         return []
     # Handle UTF-8 BOM
     if raw.startswith("\ufeff"):
@@ -743,6 +747,15 @@ async def search_customers(
     disamb     = fuzzy_cfg.get("disambiguation") or {"max_turns": 2, "order": ["ort", "strassen_prefix"]}
     max_k      = int(fuzzy_cfg.get("max_candidates_internal", 5) or 5)
 
+    # Enforce max disambiguation turns — hard-block when limit reached
+    max_turns = int(disamb.get("max_turns", 2))
+    if len(artifacts.fz_asked) >= max_turns:
+        return {
+            "ok": True, "decision": "block", "score": 0.0,
+            "coverage_ok": False, "best_candidate_customer_id": "",
+            "ask_next": "", "features": {}, "privacy": {"enumerated": False},
+        }
+
     name_q          = normalize_text(firmenname,    norm_cfg)
     ort_q           = normalize_text(standort,      norm_cfg)
     street_prefix_q = normalize_text(street_prefix, norm_cfg)
@@ -1036,7 +1049,9 @@ async def persist_and_notify(
             },
         }
 
-        blob_path = f"{CALLS_PREFIX}{call_id}.json"
+        storage_cfg = (cfg.get("storage") or {})
+        calls_prefix = storage_cfg.get("calls_prefix") or CALLS_PREFIX
+        blob_path = f"{calls_prefix}{call_id}.json"
         upload_blob_text(blob_path, json.dumps(call_log, ensure_ascii=False, indent=2))
         logger.info("Call log uploaded: %s", blob_path)
 
@@ -1087,7 +1102,11 @@ async def entrypoint(ctx: JobContext) -> None:
     speech_cfg    = cfg.get("speech") or {}
     speech_key    = _get_secret("AZURE_SPEECH_KEY")    or az_speech_cfg.get("key")    or ""
     speech_region = _get_secret("AZURE_SPEECH_REGION") or az_speech_cfg.get("region") or ""
-    speech_lang   = speech_cfg.get("language") or "de-DE"
+    speech_lang = (
+        speech_cfg.get("stt_language")
+        or speech_cfg.get("language")
+        or "de-DE"
+    )
     tts_voice     = speech_cfg.get("tts_voice") or "de-DE-ConradNeural"
 
     if not speech_key or not speech_region:
@@ -1110,9 +1129,8 @@ async def entrypoint(ctx: JobContext) -> None:
 
     # 5. Load customers CSV
     storage_cfg = cfg.get("storage") or {}
-    global CUSTOMERS_BLOB
     cust_blob = storage_cfg.get("customers_csv_blob") or CUSTOMERS_BLOB
-    customers = load_customers()
+    customers = load_customers(cust_blob)
     logger.info("Loaded %d customers from CSV.", len(customers))
 
     # 6. Derive call_id
@@ -1134,10 +1152,24 @@ async def entrypoint(ctx: JobContext) -> None:
     llm_cfg     = cfg.get("llm") or {}
     temperature = float(llm_cfg.get("temperature", 0.2))
 
+    # Build STT phrase hints from company names in customers CSV
+    cv_cfg_ep   = cfg.get("customer_verification") or {}
+    fuzzy_cfg_ep = (cv_cfg_ep.get("fuzzy") or {})
+    stt_hints_cfg = fuzzy_cfg_ep.get("stt") or {}
+    phrase_list: Optional[List[str]] = None
+    if stt_hints_cfg.get("phrase_hints") == "from_csv":
+        max_hints = int(stt_hints_cfg.get("phrase_hints_max", 500))
+        phrase_list = [
+            row["firmenname"] for row in customers
+            if row.get("firmenname")
+        ][:max_hints] or None
+        logger.info("STT phrase hints: %d company names loaded.", len(phrase_list) if phrase_list else 0)
+
     stt = livekit_azure.STT(
         speech_key=speech_key,
         speech_region=speech_region,
         language=speech_lang,
+        phrase_list=phrase_list,
     )
     tts = livekit_azure.TTS(
         speech_key=speech_key,
@@ -1158,6 +1190,7 @@ async def entrypoint(ctx: JobContext) -> None:
     # 10. Create Agent
     cv_cfg = cfg.get("customer_verification") or {}
     fuzzy_cfg = (cv_cfg.get("fuzzy") or {})
+
     fuzzy_enabled = bool(fuzzy_cfg.get("enabled", True))
     tools = [verify_customer, submit_service_order]
     if fuzzy_enabled:
@@ -1174,8 +1207,18 @@ async def entrypoint(ctx: JobContext) -> None:
 
     ctx.add_shutdown_callback(_shutdown)
 
-    # 12. Start AgentSession
-    session = AgentSession(userdata=artifacts, stt=stt, llm=llm, tts=tts)
+    # 12. Start AgentSession (with turn-detection params from config)
+    turn_cfg = cfg.get("turn") or {}
+    turn_enabled = bool(turn_cfg.get("enabled", True))
+    min_ep = float(turn_cfg.get("min_endpointing_delay", 1.5))
+    max_ep = float(turn_cfg.get("max_endpointing_delay", 20.0))
+
+    session_kwargs: Dict[str, Any] = dict(userdata=artifacts, stt=stt, llm=llm, tts=tts)
+    if turn_enabled:
+        session_kwargs["min_endpointing_delay"] = min_ep
+        session_kwargs["max_endpointing_delay"] = max_ep
+
+    session = AgentSession(**session_kwargs)
     await session.start(agent=agent, room=ctx.room)
 
     # 13. Say welcome message
