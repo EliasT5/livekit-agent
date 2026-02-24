@@ -222,7 +222,7 @@ def _default_config() -> Dict[str, Any]:
             "endpoint": "",
             "api_key": "",
             "deployment": "gpt-5-mini",
-            "api_version": "2024-10-01-preview",
+            "api_version": "2024-12-01-preview",
         },
         "azure_speech": {
             "key": "",
@@ -1094,7 +1094,7 @@ async def entrypoint(ctx: JobContext) -> None:
     azure_endpoint = _get_secret("AZURE_OPENAI_ENDPOINT") or ao_cfg.get("endpoint") or ""
     azure_api_key  = _get_secret("AZURE_OPENAI_API_KEY")  or ao_cfg.get("api_key")  or ""
     azure_deploy   = os.environ.get("AZURE_OPENAI_DEPLOYMENT") or ao_cfg.get("deployment") or "gpt-5-mini"
-    azure_api_ver  = os.environ.get("OPENAI_API_VERSION") or ao_cfg.get("api_version") or "2024-10-01-preview"
+    azure_api_ver  = os.environ.get("OPENAI_API_VERSION") or ao_cfg.get("api_version") or "2024-12-01-preview"
 
     if not azure_endpoint or not azure_api_key:
         raise RuntimeError(
@@ -1241,3 +1241,4 @@ async def entrypoint(ctx: JobContext) -> None:
 
 if __name__ == "__main__":
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, agent_name=AGENT_NAME))
+
