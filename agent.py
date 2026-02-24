@@ -949,6 +949,19 @@ def _send_email_notification(
         if artifacts.service_order:
             so = artifacts.service_order
             lines.append(f"Order: {so.order_id} — {so.problem} (priority: {so.priority})")
+
+        # Transcript in email body
+        if artifacts.transcript:
+            lines.append("")
+            lines.append("--- Transcript ---")
+            for turn in artifacts.transcript:
+                role_label = "Caller" if turn.get("role") == "user" else "Agent"
+                interrupted = " [interrupted]" if turn.get("interrupted") else ""
+                lines.append(f"{role_label}{interrupted}: {turn.get('text', '')}")
+        else:
+            lines.append("")
+            lines.append("(no transcript captured)")
+
         body = "\n".join(lines)
 
         # Attachments
@@ -958,6 +971,12 @@ def _send_email_notification(
         config_b64 = base64.b64encode(
             json.dumps(cfg, ensure_ascii=False, indent=2).encode("utf-8")
         ).decode("ascii")
+        transcript_txt = "\n".join(
+            f"{'Caller' if t.get('role') == 'user' else 'Agent'}"
+            f"{' [interrupted]' if t.get('interrupted') else ''}: {t.get('text', '')}"
+            for t in artifacts.transcript
+        ) or "(no transcript captured)"
+        transcript_b64 = base64.b64encode(transcript_txt.encode("utf-8")).decode("ascii")
 
         to_list = [{"address": r, "displayName": r} for r in recipients_raw]
 
@@ -966,6 +985,11 @@ def _send_email_notification(
             "recipients": {"to": to_list},
             "content": {"subject": subject, "plainText": body},
             "attachments": [
+                {
+                    "name": f"transcript_{call_id}.txt",
+                    "contentType": "text/plain",
+                    "contentInBase64": transcript_b64,
+                },
                 {
                     "name": f"call_{call_id}.json",
                     "contentType": "application/json",
