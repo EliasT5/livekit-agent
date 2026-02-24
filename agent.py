@@ -1,221 +1,157 @@
+"""phone-agent — German-language AI phone service agent (LiveKit + Azure)."""
 from __future__ import annotations
 
-import asyncio
-import base64
+# ── stdlib ──────────────────────────────────────────────────────────────────
+import os
+import re
+import sys
 import csv
 import io
 import json
 import logging
-import os
-import re
-import math
-from dataclasses import dataclass, asdict, field
+import base64
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
+# ── dotenv ──────────────────────────────────────────────────────────────────
 from dotenv import load_dotenv, find_dotenv
 
-from azure.storage.blob import BlobServiceClient, ContentSettings
-from azure.core.exceptions import ResourceNotFoundError
+# ── azure blob ──────────────────────────────────────────────────────────────
+from azure.storage.blob import BlobServiceClient
 
-from livekit.agents import (
-    Agent,
-    AgentServer,
-    AgentSession,
-    JobContext,
-    RunContext,
-    cli,
-)
+# ── azure identity / key vault ───────────────────────────────────────────────
+from azure.identity import DefaultAzureCredential
+from azure.keyvault.secrets import SecretClient
 
-# Optional: AutoSubscribe + ConversationItemAddedEvent exist in many LiveKit agents versions.
+# ── livekit core (try/except for version resilience) ────────────────────────
 try:
-    from livekit.agents import AutoSubscribe, ConversationItemAddedEvent  # type: ignore
-except Exception:  # pragma: no cover
-    AutoSubscribe = None  # type: ignore
-    ConversationItemAddedEvent = None  # type: ignore
+    from livekit.agents import (
+        AutoSubscribe,
+        JobContext,
+        WorkerOptions,
+        cli,
+    )
+    from livekit.agents import function_tool, RunContext, Agent, AgentSession
+except ImportError:
+    from livekit.agents import (
+        AutoSubscribe,
+        JobContext,
+        WorkerOptions,
+        cli,
+    )
+    from livekit.agents import function_tool, RunContext, Agent, AgentSession
 
-# function_tool location differs across versions
-try:
-    from livekit.agents import function_tool
-except Exception:  # pragma: no cover
-    from livekit.agents.llm import function_tool  # type: ignore
+# ── livekit plugins ─────────────────────────────────────────────────────────
+from livekit.plugins import azure as livekit_azure
+from livekit.plugins import openai as livekit_openai
 
-from livekit.plugins import azure as azure_speech
-from livekit.plugins import openai as openai_plugin
-
-# Turn detector plugin is optional depending on installed extras.
-try:
-    from livekit.plugins.turn_detector.multilingual import MultilingualModel
-except Exception:  # pragma: no cover
-    MultilingualModel = None  # type: ignore
-
-# ACS Email is optional; if not installed, we just skip sending.
+# ── optional: ACS Email ─────────────────────────────────────────────────────
+HAS_ACS_EMAIL = False
 try:
     from azure.communication.email import EmailClient
-except Exception:  # pragma: no cover
-    EmailClient = None  # type: ignore
+    HAS_ACS_EMAIL = True
+except Exception:
+    pass
 
+# ── constants ───────────────────────────────────────────────────────────────
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+BLOB_CONTAINER = os.environ.get("BLOB_CONTAINER", "assistant")
+CONFIG_BLOB = os.environ.get("CONFIG_BLOB", "config/latest.json")
+CUSTOMERS_BLOB = os.environ.get("CUSTOMERS_BLOB", "data/customers.csv")
+CALLS_PREFIX = os.environ.get("CALLS_PREFIX", "calls/")
+AGENT_NAME = os.environ.get("AGENT_NAME", "phone-assistant")
 
-# -----------------------------------------------------------------------------
-# Logging
-# -----------------------------------------------------------------------------
-
-LOG_LEVEL = (os.getenv("LOG_LEVEL") or "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
-logger = logging.getLogger("phone-agent")
+logger = logging.getLogger(__name__)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# §3  .env loading
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _load_dotenv() -> None:
+    """Search for .env files in multiple locations, never overriding existing vars."""
+    # 1. explicit path from env
+    explicit = os.environ.get("DOTENV_PATH") or os.environ.get("DOTENV_FILE")
+    if explicit and os.path.isfile(explicit):
+        load_dotenv(explicit, override=False)
+        return
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # 2. next to script
+    for name in (".env.local", ".env"):
+        p = os.path.join(script_dir, name)
+        if os.path.isfile(p):
+            load_dotenv(p, override=False)
+
+    # 3. CWD
+    cwd = os.getcwd()
+    if os.path.normpath(cwd) != os.path.normpath(script_dir):
+        for name in (".env.local", ".env"):
+            p = os.path.join(cwd, name)
+            if os.path.isfile(p):
+                load_dotenv(p, override=False)
+
+    # 4. walk upward
+    found = find_dotenv(usecwd=True)
+    if found:
+        load_dotenv(found, override=False)
 
 
-# -----------------------------------------------------------------------------
-# Dotenv (LOCAL ONLY) — cloud should inject real env vars
-# -----------------------------------------------------------------------------
+_load_dotenv()
 
-def _load_dotenv_safely() -> None:
-    """
-    Robust dotenv loading:
-    - Cloud hosting should set env vars directly (and this won't override them).
-    - Local dev can use DOTENV_PATH or typical .env / .env.local locations.
-    """
-    # Never override cloud-injected env vars.
-    override = False
+# ═══════════════════════════════════════════════════════════════════════════
+# §4  Key Vault — fetched once at process startup, cached in-memory
+# ═══════════════════════════════════════════════════════════════════════════
 
-    # 1) explicit path
-    explicit = (os.getenv("DOTENV_PATH") or os.getenv("DOTENV_FILE") or "").strip()
-    candidates: List[Path] = []
-    if explicit:
-        candidates.append(Path(explicit))
+_KV_SECRET_MAP: Dict[str, str] = {
+    "AZURE-OPENAI-API-KEY":                   "AZURE_OPENAI_API_KEY",
+    "AZURE-OPENAI-ENDPOINT":                  "AZURE_OPENAI_ENDPOINT",
+    "AZURE-SPEECH-KEY":                       "AZURE_SPEECH_KEY",
+    "AZURE-SPEECH-REGION":                    "AZURE_SPEECH_REGION",
+    "AZURE-STORAGE-CONNECTION-STRING":        "AZURE_STORAGE_CONNECTION_STRING",
+    "LIVEKIT-API-KEY":                        "LIVEKIT_API_KEY",
+    "LIVEKIT-API-SECRET":                     "LIVEKIT_API_SECRET",
+    "AZURE-COMMUNICATION-CONNECTION-STRING":  "AZURE_COMMUNICATION_CONNECTION_STRING",
+}
 
-    # 2) next to this script (common in repos)
-    candidates.extend(
-        [
-            Path(__file__).with_name(".env.local"),
-            Path(__file__).with_name(".env"),
-        ]
-    )
-
-    # 3) current working directory (common when running "python agent.py" from root)
-    candidates.extend(
-        [
-            Path.cwd() / ".env.local",
-            Path.cwd() / ".env",
-        ]
-    )
-
-    # 4) python-dotenv search (walk upwards from CWD)
-    auto = find_dotenv(usecwd=True)
-    if auto:
-        candidates.append(Path(auto))
-
-    used: Optional[Path] = None
-    for p in candidates:
-        try:
-            if p and p.exists() and p.is_file():
-                load_dotenv(dotenv_path=p, override=override)
-                used = p
-                break
-        except Exception:
-            # Don't break startup just because dotenv is weird
-            logger.debug("dotenv load failed for %s", p, exc_info=True)
-
-    if used:
-        logger.info("Loaded dotenv from %s", used)
-    else:
-        # It's perfectly fine in cloud setups.
-        logger.info("No .env file loaded (this is expected in cloud hosting).")
+_kv_cache: Dict[str, str] = {}
 
 
-_load_dotenv_safely()
+def _load_keyvault_secrets() -> None:
+    """Pull all secrets from KV via Managed Identity. Non-fatal if KV unreachable."""
+    kv_url = os.environ.get("AZURE_KEYVAULT_URL", "")
+    if not kv_url:
+        logger.info("AZURE_KEYVAULT_URL not set — using env vars only.")
+        return
+    try:
+        credential = DefaultAzureCredential()
+        client = SecretClient(vault_url=kv_url, credential=credential)
+        fetched = 0
+        for secret_name, env_name in _KV_SECRET_MAP.items():
+            try:
+                secret = client.get_secret(secret_name)
+                if secret.value:
+                    _kv_cache[env_name] = secret.value
+                    fetched += 1
+            except Exception as exc:
+                logger.debug("KV: could not fetch %r: %s", secret_name, exc)
+        logger.info("Key Vault: fetched %d/%d secrets.", fetched, len(_KV_SECRET_MAP))
+    except Exception:
+        logger.warning("Key Vault init failed — falling back to env vars.", exc_info=True)
 
 
-# -----------------------------------------------------------------------------
-# Environment (Blob paths can be overridden by config.storage.*)
-# -----------------------------------------------------------------------------
-
-BLOB_CONTAINER = (os.getenv("BLOB_CONTAINER") or "assistant").strip()
-CONFIG_BLOB = (os.getenv("CONFIG_BLOB") or "config/latest.json").strip()
-CUSTOMERS_BLOB = (os.getenv("CUSTOMERS_BLOB") or "data/customers.csv").strip()
-CALLS_PREFIX = (os.getenv("CALLS_PREFIX") or "calls/").strip()
-
-DEFAULT_OPENAI_API_VERSION = (os.getenv("OPENAI_API_VERSION") or "2024-10-01-preview").strip()
+def _get_secret(env_name: str, fallback: str = "") -> str:
+    """Priority: KV cache → os.environ → fallback. Works for local dev too."""
+    return _kv_cache.get(env_name) or os.environ.get(env_name, "") or fallback
 
 
-# -----------------------------------------------------------------------------
-# Default config (must align with the dashboard UI)
-# -----------------------------------------------------------------------------
+_load_keyvault_secrets()
 
-def _default_config() -> Dict[str, Any]:
-    return {
-        "meta": {"saved_at": None, "saved_by": None},
-        "agent": {
-            "system_prompt": (
-                "Du bist ein deutscher Telefon-Serviceassistent.\n"
-                "Ablauf: Begrüßen -> Kundennummer + Name des Anrufers + (Firmenname oder Standort) abfragen -> "
-                "per Tool verifizieren -> Serviceauftrag aufnehmen -> am Ende kurz zusammenfassen.\n"
-                "Regeln: Keine Emojis. Kurze Sätze. Immer eine Frage auf einmal."
-            ),
-            # Fallback-first: Hinweis, dass Identifikation auch ohne Kundennummer möglich ist
-            "welcome_message": "Willkommen beim Service. Bitte nennen Sie Ihre Kundennummer ODER Firma und Ort.",
-        },
-        "speech": {
-            "stt_languages": ["de-AT", "de-DE"],
-            "tts_language": "de-DE",
-            "tts_voice": "de-DE-KatjaNeural",
-        },
-        "turn": {
-            "preset": "very_patient",
-            "enabled": True,
-            "min_endpointing_delay": 1.5,
-            "max_endpointing_delay": 20.0,
-        },
-        "customer_verification": {
-            "ask_caller_name": True,
-            "max_attempts": 3,
-            "match_policy": "firm_or_site",  # firm_or_site, firm_and_site
-            # --- Fuzzy (fallback-first; Dashboard-Felder nicht erforderlich) ---
-            "fuzzy": {
-                "enabled": True,
-                "max_candidates_internal": 5,
-                "thresholds": {"allow": 0.86, "ask": 0.72, "block": 0.50},
-                "weights": {
-                    "name": 0.40,
-                    "ort": 0.25,
-                    "plz": 0.20,
-                    "addr": 0.05,
-                    "phone": 0.10,
-                    "email_domain": 0.10,
-                },
-                "normalization": {
-                    "umlaute": "ae_oe_ue",
-                    "eszett": "ss",
-                    "punct": "drop",
-                    "spaces": "collapse"
-                },
-                "phonetic": "koelner",
-                "stt": {"use_nbest": True, "phrase_hints": "from_csv"},
-                "disambiguation": {"max_turns": 2, "order": ["plz", "ort", "email_domain", "strassen_prefix"]},
-                "privacy": {"no_candidate_enumeration": True, "masked_confirmations_only": True},
-            },
-        },
-        "email": {
-            "enabled": False,
-            "sender": "",
-            "recipients": [],
-            "subject_template": "Service Call {{callId}}",
-            # "attach_config": True,  # optional: if you add it later in UI
-        },
-        "storage": {
-            "customers_csv_blob": CUSTOMERS_BLOB,
-            "calls_prefix": CALLS_PREFIX,
-        },
-        "llm": {
-            "temperature": 0.2,
-        },
-    }
-
-
-# -----------------------------------------------------------------------------
-# Data models
-# -----------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+# §7  Data models
+# ═══════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class VerifiedCustomer:
@@ -229,12 +165,12 @@ class VerifiedCustomer:
 
 @dataclass
 class ServiceOrder:
-    order_id: str
+    order_id: str          # os.urandom(8).hex()
     problem: str
-    priority: str
+    priority: str          # default "normal"
     contact_phone: str
     preferred_time: str
-    timestamp_utc: str
+    timestamp_utc: str     # datetime.now(timezone.utc).isoformat()
 
 
 @dataclass
@@ -246,6 +182,7 @@ class SessionArtifacts:
     service_order: Optional[ServiceOrder] = None
 
     transcript: List[Dict[str, Any]] = field(default_factory=list)
+    # entries: {"role": "agent"|"user", "text": str, "interrupted": bool}
     summary: Optional[str] = None
 
     caller_number: Optional[str] = None
@@ -253,215 +190,246 @@ class SessionArtifacts:
 
     verification_attempts: int = 0
 
-    # --- Fuzzy diagnostics (internal; maskierte, auditierbare Angaben) ---
-    fz_decision: Optional[str] = None                 # "allow" | "ask" | "block"
+    # Fuzzy diagnostics (masked, no PII — written to call log)
+    fz_decision: Optional[str] = None       # "allow" | "ask" | "block"
     fz_score: Optional[float] = None
     fz_coverage_ok: Optional[bool] = None
-    fz_features: Dict[str, float] = field(default_factory=dict)   # name/ort/plz/addr/phone/email_domain
-    fz_asked: List[str] = field(default_factory=list)             # welche Merkmale wurden bereits erfragt
+    fz_features: Dict[str, float] = field(default_factory=dict)
+    fz_asked: List[str] = field(default_factory=list)
 
 
-# -----------------------------------------------------------------------------
-# Azure Blob helpers
-# -----------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+# §5  Default config
+# ═══════════════════════════════════════════════════════════════════════════
 
-_blob_service: Optional[BlobServiceClient] = None
+def _default_config() -> Dict[str, Any]:
+    return {
+        "meta": {
+            "saved_at": None,
+            "saved_by": None,
+        },
+        "livekit": {
+            "url": "",
+            "api_key": "",
+            "api_secret": "",
+        },
+        "azure_openai": {
+            "endpoint": "",
+            "api_key": "",
+            "deployment": "gpt-5-mini",
+            "api_version": "2025-01-01-preview",
+        },
+        "azure_speech": {
+            "key": "",
+            "region": "",
+        },
+        "agent": {
+            "system_prompt": (
+                "Du bist ein deutscher Telefon-Serviceassistent.\n"
+                "Ablauf: Begrüßen -> Kundennummer + Name des Anrufers + "
+                "(Firmenname oder Standort) abfragen -> per Tool verifizieren -> "
+                "Serviceauftrag aufnehmen -> am Ende kurz zusammenfassen.\n"
+                "Regeln: Keine Emojis. Kurze Sätze. Immer eine Frage auf einmal."
+            ),
+            "welcome_message": (
+                "Willkommen beim Service. Bitte nennen Sie Ihre Kundennummer "
+                "ODER Firma und Ort."
+            ),
+            "runtime_rules_template": (
+                "Laufende Konfiguration (muss eingehalten werden):\n"
+                "- Name des Anrufers abfragen: {{ask_caller_name}}\n"
+                "- Max. Verifikationsversuche: {{max_attempts}}\n"
+                "Regeln:\n"
+                "- Sprich immer deutsch.\n"
+                "- Kurze Sätze. Keine Emojis.\n"
+                "- Verifiziere den Kunden IMMER über das Tool verify_customer.\n"
+                "- Wenn locked=true zurückkommt: freundlich abbrechen oder an "
+                "menschlichen Support verweisen.\n"
+                "- Nach erfolgreicher Verifikation: Serviceauftrag strukturiert "
+                "aufnehmen und submit_service_order verwenden."
+            ),
+            "fuzzy_rules": (
+                "Fuzzy-Suche & Datenschutz (verbindlich):\n"
+                "- Nutze zuerst search_customers zur internen Kandidatensuche.\n"
+                "- Nenne niemals Kandidaten oder Adressen aus dem System.\n"
+                "- Stelle genau eine Frage pro Turn: Standort oder Straßen-Prefix.\n"
+                "- Verifiziere nur, wenn decision=allow und coverage_ok=true. "
+                "Sonst eine Zusatzfrage oder Eskalation.\n"
+                "- Gib niemals customer_id oder interne Systemdaten an den Anrufer weiter.\n"
+                "- Biete Buchstabieren an, wenn unklar."
+            ),
+        },
+        "speech": {
+            "tts_voice": "de-DE-ConradNeural",
+            "language": "de-DE",
+        },
+        "turn": {
+            "preset": "very_patient",
+            "enabled": True,
+            "min_endpointing_delay": 1.5,
+            "max_endpointing_delay": 20.0,
+        },
+        "customer_verification": {
+            "ask_caller_name": True,
+            "max_attempts": 3,
+            "fuzzy": {
+                "enabled": True,
+                "max_candidates_internal": 5,
+                "thresholds": {
+                    "allow": 0.86,
+                    "ask": 0.72,
+                    "block": 0.50,
+                },
+                "weights": {
+                    "name": 0.60,
+                    "ort": 0.30,
+                    "addr": 0.10,
+                },
+                "normalization": {
+                    "umlaute": "ae_oe_ue",
+                    "eszett": "ss",
+                    "punct": "drop",
+                    "spaces": "collapse",
+                    "legal_suffixes": [
+                        "gmbh", "mbh", "ag", "kg", "ug", "ohg",
+                        "kgaa", "co", "holding", "gruppe", "group",
+                    ],
+                },
+                "phonetic": "koelner",
+                "coverage": {
+                    "name": 0.80,
+                    "ort": 0.80,
+                    "addr": 0.60,
+                    "min_positives": 1,
+                },
+                "conflict_penalty": {
+                    "name_threshold": 0.85,
+                    "ort_threshold": 0.60,
+                    "same_name_penalty": 0.05,
+                },
+                "stt": {
+                    "phrase_hints": "from_csv",
+                    "phrase_hints_max": 500,
+                },
+                "disambiguation": {
+                    "max_turns": 2,
+                    "order": ["ort", "strassen_prefix"],
+                },
+                "privacy": {
+                    "no_candidate_enumeration": True,
+                    "masked_confirmations_only": True,
+                },
+            },
+        },
+        "email": {
+            "enabled": False,
+            "sender": "",
+            "recipients": [],
+            "subject_template": "Service Call {{callId}}",
+        },
+        "storage": {
+            "customers_csv_blob": "data/customers.csv",
+            "calls_prefix": "calls/",
+        },
+        "llm": {
+            "temperature": 0.2,
+        },
+    }
 
 
-def _require_env(name: str) -> str:
-    val = (os.getenv(name) or "").strip()
-    if not val:
-        raise RuntimeError(f"Missing required env var: {name}")
-    return val
+# ═══════════════════════════════════════════════════════════════════════════
+# §5  Blob helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+def get_blob_service_client() -> BlobServiceClient:
+    conn_str = _get_secret("AZURE_STORAGE_CONNECTION_STRING")
+    if not conn_str:
+        raise RuntimeError("AZURE_STORAGE_CONNECTION_STRING is not set.")
+    return BlobServiceClient.from_connection_string(conn_str)
 
 
-def _blob_svc() -> BlobServiceClient:
-    global _blob_service
-    if _blob_service is None:
-        conn = _require_env("AZURE_STORAGE_CONNECTION_STRING")
-        _blob_service = BlobServiceClient.from_connection_string(conn)
-    return _blob_service
-
-
-def _blob_client(path: str):
-    return _blob_svc().get_blob_client(container=BLOB_CONTAINER, blob=path)
-
-
-def load_json_blob(path: str) -> Dict[str, Any]:
-    data = _blob_client(path).download_blob().readall()
-    if isinstance(data, (bytes, bytearray)):
-        data = data.decode("utf-8")
-    return json.loads(data)
-
-
-def load_csv_blob(path: str) -> List[Dict[str, str]]:
-    raw = _blob_client(path).download_blob().readall().decode("utf-8-sig")
-    rows = list(csv.DictReader(io.StringIO(raw)))
-    # normalize whitespace
-    out: List[Dict[str, str]] = []
-    for r in rows:
-        out.append({k: (v or "").strip() for k, v in r.items()})
-    return out
-
-
-def write_json_blob(path: str, payload: Dict[str, Any]) -> None:
-    b = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
-    _blob_client(path).upload_blob(
-        b,
-        overwrite=True,
-        content_settings=ContentSettings(content_type="application/json; charset=utf-8"),
-    )
-
-
-# -----------------------------------------------------------------------------
-# LiveKit credentials bootstrap (optional)
-# -----------------------------------------------------------------------------
-
-def bootstrap_livekit_env_from_blob() -> None:
-    """
-    If LIVEKIT_* are not set by the hoster, try bootstrapping them from the blob config.
-    This is optional and should not break cloud startup.
-    """
-    if os.getenv("LIVEKIT_URL") and os.getenv("LIVEKIT_API_KEY") and os.getenv("LIVEKIT_API_SECRET"):
-        return
-
-    conn = (os.getenv("AZURE_STORAGE_CONNECTION_STRING") or "").strip()
-    if not conn:
-        return
-
+def load_blob_text(blob_path: str) -> str:
     try:
-        bsc = BlobServiceClient.from_connection_string(conn)
-        blob = bsc.get_blob_client(container=BLOB_CONTAINER, blob=CONFIG_BLOB)
-        data = blob.download_blob().readall()
-        if isinstance(data, (bytes, bytearray)):
-            data = data.decode("utf-8")
-
-        cfg = json.loads(data) if data else {}
-        lk = cfg.get("livekit", {}) if isinstance(cfg, dict) else {}
-
-        url = lk.get("url") or lk.get("ws_url") or lk.get("LIVEKIT_URL")
-        api_key = lk.get("api_key") or lk.get("key") or lk.get("LIVEKIT_API_KEY")
-        api_secret = lk.get("api_secret") or lk.get("secret") or lk.get("LIVEKIT_API_SECRET")
-
-        if url and api_key and api_secret:
-            os.environ.setdefault("LIVEKIT_URL", str(url))
-            os.environ.setdefault("LIVEKIT_API_KEY", str(api_key))
-            os.environ.setdefault("LIVEKIT_API_SECRET", str(api_secret))
-            logger.info("Bootstrapped LIVEKIT_* from blob config.")
+        client = get_blob_service_client()
+        blob = client.get_blob_client(container=BLOB_CONTAINER, blob=blob_path)
+        return blob.download_blob().readall().decode("utf-8")
     except Exception:
-        logger.warning("LiveKit bootstrap from blob failed (non-fatal).", exc_info=True)
+        logger.debug("Blob not found or unreadable: %s", blob_path)
+        return ""
 
 
-bootstrap_livekit_env_from_blob()
-
-
-# -----------------------------------------------------------------------------
-# Email helper (ACS Email)
-# -----------------------------------------------------------------------------
-
-def _acs_connection_string() -> str:
-    return (
-        (os.getenv("COMMUNICATION_CONNECTION_STRING_EMAIL") or "").strip()
-        or (os.getenv("AZURE_COMMUNICATION_CONNECTION_STRING") or "").strip()
-    )
-
-
-def _render_subject(template: str, vars: Dict[str, str]) -> str:
-    """
-    Very small templating: replaces {{key}} with value.
-    Unknown keys stay as-is.
-    """
-    tmpl = template or "Service Call {{callId}}"
-
-    def repl(m: re.Match[str]) -> str:
-        key = (m.group(1) or "").strip()
-        return vars.get(key, m.group(0))
-
-    return re.sub(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}", repl, tmpl)
-
-
-def _send_email_with_attachments(
-    subject: str,
-    body_text: str,
-    sender: str,
-    recipients: List[str],
-    attachments: List[Tuple[str, str, bytes]],  # (filename, content_type, data)
-) -> None:
-    if not recipients:
-        logger.info("Email skipped: no recipients configured.")
-        return
-    if not sender:
-        logger.warning("Email skipped: sender is empty (config.email.sender).")
-        return
-    conn = _acs_connection_string()
-    if not conn:
-        logger.warning("Email skipped: ACS connection string missing (COMMUNICATION_CONNECTION_STRING_EMAIL).")
-        return
-    if EmailClient is None:
-        logger.warning("Email skipped: azure.communication.email not installed.")
-        return
-
+def upload_blob_text(blob_path: str, content: str) -> None:
     try:
-        email_client = EmailClient.from_connection_string(conn)
-
-        atts = []
-        for (fname, ctype, data) in attachments:
-            atts.append(
-                {
-                    "name": fname,
-                    "contentType": ctype,
-                    "contentInBase64": base64.b64encode(data).decode("utf-8"),
-                }
-            )
-
-        message = {
-            "senderAddress": sender,
-            "recipients": {"to": [{"address": r} for r in recipients]},
-            "content": {"subject": subject, "plainText": body_text},
-            "attachments": atts,
-        }
-
-        poller = email_client.begin_send(message)
-        result = poller.result()
-        status = (result or {}).get("status")
-        msg_id = (result or {}).get("id")
-        logger.info("Email sent via ACS: status=%s id=%s", status, msg_id)
+        client = get_blob_service_client()
+        blob = client.get_blob_client(container=BLOB_CONTAINER, blob=blob_path)
+        blob.upload_blob(content.encode("utf-8"), overwrite=True)
     except Exception:
-        logger.exception("Failed to send email via ACS")
+        logger.exception("Failed to upload blob: %s", blob_path)
 
 
-# -----------------------------------------------------------------------------
-# Helpers: config access
-# -----------------------------------------------------------------------------
-
-def _get_cfg(artifacts: SessionArtifacts, *path: str, default: Any = None) -> Any:
-    cur: Any = artifacts.config
-    for p in path:
-        if not isinstance(cur, dict):
-            return default
-        cur = cur.get(p)
-    return default if cur is None else cur
+def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    merged = dict(base)
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(merged.get(k), dict):
+            merged[k] = _deep_merge(merged[k], v)
+        else:
+            merged[k] = v
+    return merged
 
 
-# -----------------------------------------------------------------------------
-# >>>>>>  Fuzzy utilities (local, fallback-first, no extra deps)  <<<<<<
-# -----------------------------------------------------------------------------
+def load_config() -> Dict[str, Any]:
+    defaults = _default_config()
+    raw = load_blob_text(CONFIG_BLOB)
+    if not raw.strip():
+        logger.info("No blob config found at %s — using defaults.", CONFIG_BLOB)
+        return defaults
+    try:
+        blob_cfg = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("Invalid JSON in %s — using defaults.", CONFIG_BLOB)
+        return defaults
+    return _deep_merge(defaults, blob_cfg)
 
-# Lightweight normalization & similarity helpers to support robust fuzzy search
+
+def load_customers() -> List[Dict[str, str]]:
+    raw = load_blob_text(CUSTOMERS_BLOB)
+    if not raw.strip():
+        logger.warning("Customer CSV is empty or missing: %s", CUSTOMERS_BLOB)
+        return []
+    # Handle UTF-8 BOM
+    if raw.startswith("\ufeff"):
+        raw = raw[1:]
+    reader = csv.DictReader(io.StringIO(raw))
+    rows: List[Dict[str, str]] = []
+    for row in reader:
+        cleaned = {(k or "").strip(): (v or "").strip() for k, v in row.items()}
+        rows.append(cleaned)
+    return rows
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# §8  Fuzzy matching system (pure Python)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ── 8.1 Helpers and normalization ───────────────────────────────────────────
+
 _LEGAL_SUFFIX_STOPWORDS: Set[str] = {
-    "gmbh", "mbh", "ag", "kg", "ug", "ohg", "kgaa", "co", "co.", "holding", "gruppe", "group"
+    "gmbh", "mbh", "ag", "kg", "ug", "ohg", "kgaa",
+    "co", "co.", "holding", "gruppe", "group",
 }
+
 
 def _collapse_spaces(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
 
+
 def _strip_punct(s: str) -> str:
     return re.sub(r"[^\w\s\-]", " ", s or "")
+
 
 def _german_umlaut_norm(s: str, cfg: Dict[str, Any]) -> str:
     if not s:
         return s
-    # default behaviour: ae/oe/ue, ss
     if (cfg or {}).get("umlaute", "ae_oe_ue") == "ae_oe_ue":
         s = (
             s.replace("Ä", "Ae").replace("Ö", "Oe").replace("Ü", "Ue")
@@ -471,32 +439,28 @@ def _german_umlaut_norm(s: str, cfg: Dict[str, Any]) -> str:
         s = s.replace("ß", "ss")
     return s
 
+
 def normalize_text(s: str, norm_cfg: Dict[str, Any]) -> str:
-    """
-    - casefold
-    - german umlauts + ß -> ae/oe/ue/ss (configurable)
-    - drop punctuation (configurable)
-    - collapse spaces
-    - drop common legal suffixes
-    """
     s = s or ""
     s = _german_umlaut_norm(s, norm_cfg)
     if (norm_cfg or {}).get("punct", "drop") == "drop":
         s = _strip_punct(s)
     s = _collapse_spaces(s)
     s = s.casefold()
-    # drop common legal suffixes (token-level)
-    tokens = [t for t in s.split(" ") if t and (t not in _LEGAL_SUFFIX_STOPWORDS)]
+    # drop legal suffixes loaded from config (or module-level default)
+    legal = set(norm_cfg.get("legal_suffixes", [])) or _LEGAL_SUFFIX_STOPWORDS
+    tokens = [t for t in s.split(" ") if t and t not in legal]
     return " ".join(tokens)
 
-def eq_norm(a: str, b: str) -> bool:
-    return (a or "").strip().casefold() == (b or "").strip().casefold()
+
+# ── 8.2 Similarity functions ───────────────────────────────────────────────
 
 def _ngrams(s: str, n: int = 3) -> Set[str]:
     s = _collapse_spaces(s)
     if len(s) < n:
         return {s} if s else set()
     return {s[i:i+n] for i in range(len(s)-n+1)}
+
 
 def sim_trigram(a: str, b: str) -> float:
     A, B = _ngrams(a, 3), _ngrams(b, 3)
@@ -506,8 +470,8 @@ def sim_trigram(a: str, b: str) -> float:
     union = len(A | B)
     return inter / union if union else 0.0
 
+
 def sim_levenshtein(a: str, b: str) -> float:
-    # normalized Levenshtein similarity (0..1)
     a, b = a or "", b or ""
     if not a and not b:
         return 1.0
@@ -521,26 +485,23 @@ def sim_levenshtein(a: str, b: str) -> float:
         ca = a[i - 1]
         for j in range(1, lb + 1):
             cost = 0 if ca == b[j - 1] else 1
-            cur = min(
-                dp[j] + 1,        # deletion
-                dp[j - 1] + 1,    # insertion
-                prev + cost       # substitution
-            )
+            cur = min(dp[j] + 1, dp[j - 1] + 1, prev + cost)
             prev, dp[j] = dp[j], cur
-    dist = dp[lb]
-    max_len = max(la, lb)
-    return 1.0 - (dist / max_len)
+    return 1.0 - (dp[lb] / max(la, lb))
+
 
 def sim_token_set(a: str, b: str) -> float:
-    ta = set([t for t in (_collapse_spaces(a).split(" ")) if t])
-    tb = set([t for t in (_collapse_spaces(b).split(" ")) if t])
+    ta = set(t for t in _collapse_spaces(a).split(" ") if t)
+    tb = set(t for t in _collapse_spaces(b).split(" ") if t)
     if not ta or not tb:
         return 0.0
     inter = len(ta & tb)
     union = len(ta | tb)
     return inter / union if union else 0.0
 
-# very compact Kölner Phonetik (sufficient for rough calls)
+
+# ── 8.3 Kölner Phonetik ────────────────────────────────────────────────────
+
 def phonetic_koelner(s: str) -> str:
     s = (s or "").lower()
     s = _german_umlaut_norm(s, {"umlaute": "ae_oe_ue", "eszett": "ss"})
@@ -548,142 +509,308 @@ def phonetic_koelner(s: str) -> str:
     if not s:
         return ""
 
-    # mapping as per simplified Kölner Phonetik
     def code_char(ch: str, prev: str, nxt: str) -> str:
-        if ch in "aeiouyj":
-            return "0"
-        if ch == "h":
-            return ""
-        if ch == "b":
-            return "1"
-        if ch in "p":
-            return "1" if nxt != "h" else "3"
-        if ch in "d,t":
-            return "2"
-        if ch in "f,v,w":
-            return "3"
-        if ch == "p" and nxt == "h":
-            return "3"
-        if ch in "g,k,q":
-            return "4"
-        if ch == "x":
-            return "48"
-        if ch in "c":
-            # simple variant
-            return "4"
-        if ch in "s,z,ß":
-            return "8"
-        if ch in "l":
-            return "5"
-        if ch in "m,n":
-            return "6"
-        if ch in "r":
-            return "7"
+        if ch in "aeiouyj":  return "0"
+        if ch == "h":        return ""
+        if ch == "b":        return "1"
+        if ch == "p":        return "1" if nxt != "h" else "3"
+        if ch in "dt":       return "2"
+        if ch in "fvw":      return "3"
+        if ch in "gkq":      return "4"
+        if ch == "x":        return "48"
+        if ch == "c":        return "4"
+        if ch in "szß":      return "8"
+        if ch == "l":        return "5"
+        if ch in "mn":       return "6"
+        if ch == "r":        return "7"
         return ""
 
     out: List[str] = []
     for i, ch in enumerate(s):
         prev = s[i - 1] if i > 0 else ""
-        nxt = s[i + 1] if i + 1 < len(s) else ""
+        nxt  = s[i + 1] if i + 1 < len(s) else ""
         out.append(code_char(ch, prev, nxt))
-    # remove consecutive duplicates
     dedup: List[str] = []
     for c in out:
         if not dedup or c != dedup[-1]:
             dedup.append(c)
     return "".join(dedup)
 
-def extract_email_domain(email: str) -> str:
-    m = re.search(r"@([A-Za-z0-9\.\-]+)$", (email or "").strip())
-    return (m.group(1) or "").casefold() if m else ""
+
+# ── 8.4 Feature scoring ────────────────────────────────────────────────────
+
+def _compute_feature_scores(
+    name_q: str, ort_q: str, street_prefix_q: str,
+    row: Dict[str, str],
+    norm_cfg: Dict[str, Any],
+) -> Dict[str, float]:
+    name_r = normalize_text(row.get("firmenname", "") or "", norm_cfg)
+    ort_r  = normalize_text(row.get("standort", "") or "", norm_cfg)
+    addr_r = normalize_text(row.get("adresse", "") or "", norm_cfg)
+
+    # name: trigram + levenshtein + token-set, phonetic boost
+    name_char = max(sim_trigram(name_q, name_r), sim_levenshtein(name_q, name_r))
+    name_sim  = max(name_char, sim_token_set(name_q, name_r))
+    if name_q and name_r and phonetic_koelner(name_q) == phonetic_koelner(name_r):
+        name_sim = max(name_sim, 0.95)
+
+    # ort: trigram + levenshtein, phonetic boost
+    ort_sim = max(sim_trigram(ort_q, ort_r), sim_levenshtein(ort_q, ort_r))
+    if ort_q and ort_r and phonetic_koelner(ort_q) == phonetic_koelner(ort_r):
+        ort_sim = max(ort_sim, 0.95)
+
+    # addr: prefix match or trigram
+    addr_sim = 0.0
+    if street_prefix_q and addr_r:
+        if addr_r.startswith(street_prefix_q):
+            addr_sim = 0.8
+        else:
+            addr_sim = 0.6 * sim_trigram(street_prefix_q, addr_r)
+
+    return {
+        "name": float(name_sim),
+        "ort":  float(ort_sim),
+        "addr": float(addr_sim),
+    }
 
 
-# -----------------------------------------------------------------------------
-# Customer verification + service order tools
-# -----------------------------------------------------------------------------
+# ── 8.5 Weighted score, coverage, conflict penalty ─────────────────────────
+
+def _weighted_score(features: Dict[str, float], weights: Dict[str, float]) -> float:
+    score = 0.0
+    total_w = 0.0
+    for k, v in features.items():
+        w = float(weights.get(k, 0.0))
+        score   += v * w
+        total_w += w
+    return (score / total_w) if total_w > 0 else 0.0
+
+
+def _coverage_ok(features: Dict[str, float], cov_cfg: Dict[str, Any]) -> bool:
+    positives = 0
+    if features.get("name", 0.0) >= float(cov_cfg.get("name", 0.80)): positives += 1
+    if features.get("ort",  0.0) >= float(cov_cfg.get("ort",  0.80)): positives += 1
+    if features.get("addr", 0.0) >= float(cov_cfg.get("addr", 0.60)): positives += 1
+    return positives >= int(cov_cfg.get("min_positives", 1))
+
+
+def _conflict_penalty(features: Dict[str, float], pen_cfg: Dict[str, Any]) -> float:
+    penalty = 0.0
+    name_th = float(pen_cfg.get("name_threshold", 0.85))
+    ort_th  = float(pen_cfg.get("ort_threshold",  0.60))
+    pen     = float(pen_cfg.get("same_name_penalty", 0.05))
+    # High name match but ort very low → slight penalty (ambiguous same-name companies)
+    if features.get("name", 0.0) >= name_th and features.get("ort", 0.0) < ort_th:
+        penalty += pen
+    return penalty
+
+
+# ── 8.6 Disambiguation helper ──────────────────────────────────────────────
+
+def _choose_ask_next(
+    order: List[str],
+    provided: Dict[str, str],
+    asked: List[str],
+    features: Dict[str, float],
+) -> str:
+    already = set(asked or [])
+    for feat in order:
+        if feat in already:
+            continue
+        if feat == "ort" and not provided.get("ort"):
+            return "ort"
+        if feat == "strassen_prefix" and not provided.get("street_prefix"):
+            return "strassen_prefix"
+    # fallback: weakest remaining feature
+    weakest = min(features.items(), key=lambda kv: kv[1])[0] if features else ""
+    return {"addr": "strassen_prefix"}.get(weakest, "")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# §10  Template & config helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _render_template(template: str, vars: Dict[str, str]) -> str:
+    def repl(m):
+        return vars.get((m.group(1) or "").strip(), m.group(0))
+    return re.sub(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}", repl, template or "")
+
+
+def _get_cfg(artifacts: SessionArtifacts, *keys: str, default: Any = None) -> Any:
+    obj: Any = artifacts.config or {}
+    for k in keys:
+        if isinstance(obj, dict):
+            obj = obj.get(k)
+        else:
+            return default
+        if obj is None:
+            return default
+    return obj
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# §9  Tools (@function_tool)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ── 9.1 verify_customer ────────────────────────────────────────────────────
 
 @function_tool
 async def verify_customer(
     context: RunContext,
-    customer_id: str,
+    customer_id: str = "",
     caller_name: str = "",
     firmenname: str = "",
-    standort: str = "",
 ) -> Dict[str, Any]:
     """
-    Verifiziert Kunden gegen customers.csv aus Blob.
-    Verwendet config.customer_verification:
-      - ask_caller_name (bool)
-      - max_attempts (int)
-      - match_policy: firm_or_site | firm_and_site
+    Verifiziert Kunden gegen customers.csv.
+    Pfad 1: customer_id (exakt).
+    Pfad 2: firmenname (exakt, case-insensitive).
     """
     artifacts: SessionArtifacts = context.userdata
     artifacts.verification_attempts += 1
 
     max_attempts = int(_get_cfg(artifacts, "customer_verification", "max_attempts", default=3) or 3)
     if artifacts.verification_attempts > max_attempts:
-        return {
-            "ok": False,
-            "locked": True,
-            "reason": f"Maximale Verifikationsversuche erreicht ({max_attempts}).",
-        }
+        return {"ok": False, "locked": True,
+                "reason": f"Maximale Verifikationsversuche erreicht ({max_attempts})."}
 
-    customer_id = (customer_id or "").strip()
-    if not customer_id:
-        return {"ok": False, "reason": "Kundennummer fehlt."}
+    customer_id_in   = (customer_id or "").strip()
+    firmenname_in    = (firmenname  or "").strip()
 
-    row = next((r for r in artifacts.customers if (r.get("customer_id") or "").strip() == customer_id), None)
-    if not row:
-        return {"ok": False, "reason": "Kundennummer nicht gefunden."}
+    # Path 1: exact match on customer_id
+    if customer_id_in:
+        row = next(
+            (r for r in artifacts.customers
+             if any((v or "").strip() == customer_id_in for v in r.values())),
+            None,
+        )
+        if not row:
+            return {"ok": False, "reason": "Kundennummer nicht gefunden."}
+
+    # Path 2: exact case-insensitive match on firmenname column
+    elif firmenname_in:
+        row = next(
+            (r for r in artifacts.customers
+             if (r.get("firmenname") or "").strip().lower() == firmenname_in.lower()),
+            None,
+        )
+        if not row:
+            return {"ok": False, "reason": "Firmenname nicht gefunden."}
+
+    else:
+        return {"ok": False, "reason": "Bitte nennen Sie Ihre Kundennummer oder Ihren Firmennamen."}
 
     ask_name = bool(_get_cfg(artifacts, "customer_verification", "ask_caller_name", default=True))
     caller_name = (caller_name or "").strip()
     if ask_name and not caller_name:
         return {"ok": False, "reason": "Name des Anrufers fehlt."}
 
-    policy = str(_get_cfg(artifacts, "customer_verification", "match_policy", default="firm_or_site") or "firm_or_site").strip()
-
-    firmenname_in = (firmenname or "").strip()
-    standort_in = (standort or "").strip()
-
-    firm_ok = False
-    site_ok = False
-
-    if firmenname_in:
-        firm_ok = (row.get("firmenname", "") or "").strip().lower() == firmenname_in.lower()
-    if standort_in:
-        site_ok = (row.get("standort", "") or "").strip().lower() == standort_in.lower()
-
-    if policy == "firm_and_site":
-        if not (firmenname_in and standort_in):
-            return {"ok": False, "reason": "Für die Verifikation brauche ich Firmenname UND Standort."}
-        if not (firm_ok and site_ok):
-            return {"ok": False, "reason": "Firmenname oder Standort stimmt nicht überein."}
-    else:
-        # default: firm_or_site
-        if not (firmenname_in or standort_in):
-            return {"ok": False, "reason": "Bitte nennen Sie Firmenname oder Standort."}
-        if not (firm_ok or site_ok):
-            return {"ok": False, "reason": "Firmenname oder Standort stimmt nicht überein."}
-
     vc = VerifiedCustomer(
-        customer_id=row.get("customer_id", "") or "",
-        firmenname=row.get("firmenname", "") or "",
-        standort=row.get("standort", "") or "",
-        adresse=row.get("adresse", "") or "",
-        country=row.get("country", "") or "",
-        caller_name=caller_name or "",
+        customer_id=row.get("customer_id") or "",
+        firmenname=row.get("firmenname")   or "",
+        standort=row.get("standort")       or "",
+        adresse=row.get("adresse")         or "",
+        country=row.get("country")         or "",
+        caller_name=caller_name            or "",
     )
     artifacts.verified_customer = vc
+    return {"ok": True, "customer_id": vc.customer_id, "firmenname": vc.firmenname,
+            "standort": vc.standort, "caller_name": vc.caller_name}
+
+
+# ── 9.2 search_customers ──────────────────────────────────────────────────
+
+@function_tool
+async def search_customers(
+    context: RunContext,
+    firmenname: str = "",
+    standort: str = "",
+    street_prefix: str = "",
+) -> Dict[str, Any]:
+    """
+    Interne fuzzy Kandidatensuche OHNE Kandidatennennung nach außen.
+    Sucht nur über CSV-Spalten: firmenname, standort, adresse.
+    """
+    artifacts: SessionArtifacts = context.userdata
+    cv_cfg    = (artifacts.config or {}).get("customer_verification") or {}
+    fuzzy_cfg = (cv_cfg.get("fuzzy") or {})
+
+    thresholds = fuzzy_cfg.get("thresholds") or {"allow": 0.86, "ask": 0.72, "block": 0.50}
+    weights    = fuzzy_cfg.get("weights")    or {"name": 0.60, "ort": 0.30, "addr": 0.10}
+    norm_cfg   = fuzzy_cfg.get("normalization") or {"umlaute": "ae_oe_ue", "eszett": "ss", "punct": "drop"}
+    cov_cfg    = fuzzy_cfg.get("coverage")   or {"name": 0.80, "ort": 0.80, "addr": 0.60, "min_positives": 1}
+    pen_cfg    = fuzzy_cfg.get("conflict_penalty") or {}
+    disamb     = fuzzy_cfg.get("disambiguation") or {"max_turns": 2, "order": ["ort", "strassen_prefix"]}
+    max_k      = int(fuzzy_cfg.get("max_candidates_internal", 5) or 5)
+
+    name_q          = normalize_text(firmenname,    norm_cfg)
+    ort_q           = normalize_text(standort,      norm_cfg)
+    street_prefix_q = normalize_text(street_prefix, norm_cfg)
+
+    provided = {"ort": ort_q, "street_prefix": street_prefix_q}
+
+    scored: List[Tuple[str, float, Dict[str, float]]] = []
+    for row in artifacts.customers or []:
+        cid = (row.get("customer_id") or "").strip()
+        if not cid:
+            continue
+        feats      = _compute_feature_scores(name_q, ort_q, street_prefix_q, row, norm_cfg)
+        score_base = _weighted_score(feats, weights)
+        penalty    = _conflict_penalty(feats, pen_cfg)
+        scored.append((cid, max(0.0, score_base - penalty), feats))
+
+    scored.sort(key=lambda t: t[1], reverse=True)
+    shortlist = scored[:max_k] if max_k > 0 else scored
+    best_cid, best_score, best_feats = (shortlist[0] if shortlist else ("", 0.0, {}))
+
+    cov_ok = _coverage_ok(best_feats, cov_cfg) if shortlist else False
+
+    allow_th = float(thresholds.get("allow", 0.86))
+    ask_th   = float(thresholds.get("ask",   0.72))
+
+    if best_score >= allow_th and cov_ok:
+        decision = "allow"
+        ask_next = ""
+    elif best_score >= ask_th:
+        decision = "ask"
+        ask_next = _choose_ask_next(
+            list(disamb.get("order") or ["ort", "strassen_prefix"]),
+            provided, artifacts.fz_asked, best_feats,
+        )
+    else:
+        decision = "block"
+        ask_next = _choose_ask_next(
+            list(disamb.get("order") or []),
+            provided, artifacts.fz_asked, best_feats,
+        )
+
+    artifacts.fz_decision    = decision
+    artifacts.fz_score       = float(best_score)
+    artifacts.fz_coverage_ok = bool(cov_ok)
+    artifacts.fz_features    = {k: float(best_feats.get(k, 0.0)) for k in ("name", "ort", "addr")}
+
+    newly = []
+    if ort_q:           newly.append("ort")
+    if street_prefix_q: newly.append("strassen_prefix")
+    seen = set(artifacts.fz_asked)
+    for x in newly:
+        if x not in seen:
+            artifacts.fz_asked.append(x)
+            seen.add(x)
 
     return {
         "ok": True,
-        "customer_id": vc.customer_id,
-        "firmenname": vc.firmenname,
-        "standort": vc.standort,
-        "caller_name": vc.caller_name,
+        "decision": decision,
+        "score": float(best_score),
+        "coverage_ok": bool(cov_ok),
+        "best_candidate_customer_id": best_cid,   # INTERNAL ONLY; never speak this
+        "ask_next": ask_next,
+        "features": artifacts.fz_features,
+        "privacy": {"enumerated": False},
     }
 
+
+# ── 9.3 submit_service_order ──────────────────────────────────────────────
 
 @function_tool
 async def submit_service_order(
@@ -693,9 +820,7 @@ async def submit_service_order(
     contact_phone: str = "",
     preferred_time: str = "",
 ) -> Dict[str, Any]:
-    """
-    Speichert einen Serviceauftrag im Session-Context.
-    """
+    """Speichert einen Serviceauftrag im Session-Context."""
     artifacts: SessionArtifacts = context.userdata
     if not artifacts.verified_customer:
         return {"ok": False, "reason": "Kunde ist nicht verifiziert."}
@@ -712,641 +837,359 @@ async def submit_service_order(
     return {"ok": True, "order_id": order.order_id}
 
 
-# -----------------------------------------------------------------------------
-# NEW TOOL: search_customers  (fuzzy, privacy-first, no candidate enumeration)
-# -----------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+# §10  System prompt builder
+# ═══════════════════════════════════════════════════════════════════════════
 
-def _norm_digits(s: str) -> str:
-    return re.sub(r"\D", "", s or "")
+def _build_system_prompt(cfg: Dict[str, Any]) -> str:
+    agent_cfg = cfg.get("agent", {})
+    cv_cfg    = cfg.get("customer_verification", {})
 
-def _candidate_field(row: Dict[str, str], keys: List[str]) -> str:
-    for k in keys:
-        if k in row and row.get(k):
-            return row.get(k, "")
-    return ""
-
-def _compute_feature_scores(
-    name_q: str, ort_q: str, plz_q: str, street_prefix_q: str, domain_q: str, phone_q: str,
-    row: Dict[str, str],
-    norm_cfg: Dict[str, Any],
-) -> Dict[str, float]:
-    # extract row fields w/ flexible schema
-    name_r_raw = _candidate_field(row, ["firmenname", "firma", "name", "organisation", "organisation2"])
-    ort_r_raw  = _candidate_field(row, ["standort", "ort", "city", "stadt"])
-    plz_r_raw  = _candidate_field(row, ["plz", "postalcode", "zip"])
-    addr_r_raw = _candidate_field(row, ["adresse", "address", "straße", "strasse", "str"])
-    email_r    = _candidate_field(row, ["email", "e-mail", "email1", "e_mail", "mail"])
-    phone_r    = _candidate_field(row, ["phone", "telefon", "telefon büro", "telefon mobil", "telefon privat", "tel"])
-
-    name_r = normalize_text(name_r_raw, norm_cfg)
-    ort_r  = normalize_text(ort_r_raw, norm_cfg)
-    addr_r = normalize_text(addr_r_raw, norm_cfg)
-    plz_r  = _norm_digits(plz_r_raw)
-    domain_r = extract_email_domain(email_r)
-    phone_r_norm = re.sub(r"[^\d\+]", "", phone_r or "")
-
-    # name similarity (mix char + token; phonetic as booster)
-    name_char = max(sim_trigram(name_q, name_r), sim_levenshtein(name_q, name_r))
-    name_tok  = sim_token_set(name_q, name_r)
-    name_sim  = max(name_char, name_tok)
-    if name_q and name_r and phonetic_koelner(name_q) == phonetic_koelner(name_r):
-        name_sim = max(name_sim, 0.95)
-
-    # ort similarity (char + phonetic)
-    ort_char = max(sim_trigram(ort_q, ort_r), sim_levenshtein(ort_q, ort_r))
-    ort_sim  = ort_char
-    if ort_q and ort_r and phonetic_koelner(ort_q) == phonetic_koelner(ort_r):
-        ort_sim = max(ort_sim, 0.95)
-
-    # plz
-    plz_match = 1.0 if plz_q and plz_r and plz_q == plz_r else 0.0
-
-    # address (prefix-focused)
-    addr_sim = 0.0
-    if street_prefix_q and addr_r:
-        if addr_r.startswith(street_prefix_q):
-            addr_sim = 0.8
-        else:
-            addr_sim = 0.6 * sim_trigram(street_prefix_q, addr_r)
-
-    # phone, email domain
-    phone_match = 1.0 if phone_q and phone_r_norm and phone_q == phone_r_norm else 0.0
-    email_domain_match = 1.0 if domain_q and domain_r and domain_q == domain_r else 0.0
-
-    return {
-        "name": float(name_sim),
-        "ort": float(ort_sim),
-        "plz": float(plz_match),
-        "addr": float(addr_sim),
-        "phone": float(phone_match),
-        "email_domain": float(email_domain_match),
-    }
-
-def _weighted_score(features: Dict[str, float], weights: Dict[str, float]) -> float:
-    score = 0.0
-    total_w = 0.0
-    for k, v in features.items():
-        w = float(weights.get(k, 0.0))
-        score += v * w
-        total_w += w
-    return (score / total_w) if total_w > 0 else 0.0
-
-def _coverage_ok(features: Dict[str, float]) -> bool:
-    positives = 0
-    # define "independent positive" per feature
-    if features.get("name", 0.0) >= 0.80: positives += 1
-    if features.get("ort", 0.0)  >= 0.80: positives += 1
-    if features.get("plz", 0.0)  >= 1.00: positives += 1
-    if features.get("addr", 0.0) >= 0.60: positives += 1
-    if features.get("phone", 0.0) >= 1.00: positives += 1
-    if features.get("email_domain", 0.0) >= 1.00: positives += 1
-    return positives >= 2
-
-def _conflict_penalty(features: Dict[str, float], plz_q: str, ort_q: str) -> float:
-    penalty = 0.0
-    # If name is high but PLZ absent or contradictory and ort low -> penalize slightly
-    if features.get("name", 0.0) >= 0.85 and features.get("plz", 0.0) < 1.0 and features.get("ort", 0.0) < 0.60:
-        penalty += 0.05
-    # Known mismatch: user provided PLZ but ort similarity is very low
-    if plz_q and features.get("plz", 0.0) < 1.0 and ort_q and features.get("ort", 0.0) < 0.40:
-        penalty += 0.10
-    return penalty
-
-def _choose_ask_next(order: List[str], provided: Dict[str, str], asked: List[str], features: Dict[str, float]) -> str:
-    already = set(asked or [])
-    for feat in order:
-        if feat in already:
-            continue
-        # ask for the most informative missing/weak feature
-        if feat == "plz" and not provided.get("plz"):
-            return "plz"
-        if feat == "ort" and not provided.get("ort"):
-            return "ort"
-        if feat == "email_domain" and not provided.get("email_domain"):
-            return "email_domain"
-        if feat == "strassen_prefix" and not provided.get("street_prefix"):
-            return "strassen_prefix"
-    # fallback: ask for the weakest (if any)
-    weakest = min(features.items(), key=lambda kv: kv[1])[0] if features else ""
-    mapping = {"email_domain": "email_domain", "addr": "strassen_prefix"}
-    return mapping.get(weakest, "")
-
-@function_tool
-async def search_customers(
-    context: RunContext,
-    firmenname: str = "",
-    ort: str = "",
-    plz: str = "",
-    email: str = "",
-    phone_e164: str = "",
-    street_prefix: str = "",
-) -> Dict[str, Any]:
-    """
-    Interne fuzzy Kandidatensuche OHNE Kandidatennennung nach außen.
-    Rückgabe steuert Dialog: (decision, ask_next) und False-Positive-Guard via score/coverage.
-    """
-    artifacts: SessionArtifacts = context.userdata
-    cfg = artifacts.config or {}
-    cv_cfg = (cfg.get("customer_verification") or {}) if isinstance(cfg, dict) else {}
-    fuzzy_cfg = (cv_cfg.get("fuzzy") or {}) if isinstance(cv_cfg, dict) else {}
-
-    # defaults (fallback-first)
-    thresholds = (fuzzy_cfg.get("thresholds") or {"allow": 0.86, "ask": 0.72, "block": 0.50})
-    weights = (fuzzy_cfg.get("weights") or {"name": 0.40, "ort": 0.25, "plz": 0.20, "addr": 0.05, "phone": 0.10, "email_domain": 0.10})
-    norm_cfg = (fuzzy_cfg.get("normalization") or {"umlaute": "ae_oe_ue", "eszett": "ss", "punct": "drop", "spaces": "collapse"})
-    disamb = (fuzzy_cfg.get("disambiguation") or {"max_turns": 2, "order": ["plz", "ort", "email_domain", "strassen_prefix"]})
-    max_k = int(fuzzy_cfg.get("max_candidates_internal", 5) or 5)
-
-    # normalize inputs
-    name_q = normalize_text(firmenname, norm_cfg)
-    ort_q = normalize_text(ort, norm_cfg)
-    plz_q = _norm_digits(plz)
-    domain_q = extract_email_domain(email)
-    phone_q = re.sub(r"[^\d\+]", "", phone_e164 or "")
-    street_prefix_q = normalize_text(street_prefix, norm_cfg)
-
-    provided = {
-        "name": name_q,
-        "ort": ort_q,
-        "plz": plz_q,
-        "email_domain": domain_q,
-        "phone": phone_q,
-        "street_prefix": street_prefix_q,
-    }
-
-    # compute features + scores over all customers
-    scored: List[Tuple[str, float, Dict[str, float]]] = []
-    for row in artifacts.customers or []:
-        cid = (row.get("customer_id") or "").strip()
-        if not cid:
-            continue
-        feats = _compute_feature_scores(name_q, ort_q, plz_q, street_prefix_q, domain_q, phone_q, row, norm_cfg)
-        score_base = _weighted_score(feats, weights)
-        penalty = _conflict_penalty(feats, plz_q, ort_q)
-        score = max(0.0, score_base - penalty)
-        scored.append((cid, score, feats))
-
-    # shortlist
-    scored.sort(key=lambda t: t[1], reverse=True)
-    shortlist = scored[:max_k] if max_k > 0 else scored
-    best_cid, best_score, best_feats = (shortlist[0] if shortlist else ("", 0.0, {}))
-
-    cov_ok = _coverage_ok(best_feats) if shortlist else False
-
-    # decision
-    allow_th = float(thresholds.get("allow", 0.86))
-    ask_th = float(thresholds.get("ask", 0.72))
-    # block_th not explicitly needed here; everything < ask_th is effectively "block"
-
-    if best_score >= allow_th and cov_ok:
-        decision = "allow"
-        ask_next = ""
-    elif best_score >= ask_th:
-        decision = "ask"
-        order = list((disamb.get("order") or ["plz", "ort", "email_domain", "strassen_prefix"]))
-        ask_next = _choose_ask_next(order, provided, artifacts.fz_asked, best_feats)
-    else:
-        decision = "block"
-        ask_next = _choose_ask_next(list((disamb.get("order") or [])), provided, artifacts.fz_asked, best_feats)
-
-    # update artifacts (maskierte Diagnostik)
-    artifacts.fz_decision = decision
-    artifacts.fz_score = float(best_score)
-    artifacts.fz_coverage_ok = bool(cov_ok)
-    artifacts.fz_features = {
-        "name": float(best_feats.get("name", 0.0)),
-        "ort": float(best_feats.get("ort", 0.0)),
-        "plz": float(best_feats.get("plz", 0.0)),
-        "addr": float(best_feats.get("addr", 0.0)),
-        "phone": float(best_feats.get("phone", 0.0)),
-        "email_domain": float(best_feats.get("email_domain", 0.0)),
-    }
-
-    # track which features were provided this turn (approximates "asked features")
-    newly_provided: List[str] = []
-    if plz_q: newly_provided.append("plz")
-    if ort_q: newly_provided.append("ort")
-    if domain_q: newly_provided.append("email_domain")
-    if street_prefix_q: newly_provided.append("strassen_prefix")
-    if newly_provided:
-        # maintain uniqueness while preserving order
-        seen = set(artifacts.fz_asked)
-        for x in newly_provided:
-            if x not in seen:
-                artifacts.fz_asked.append(x)
-                seen.add(x)
-
-    return {
-        "ok": True,
-        "decision": decision,
-        "score": float(best_score),
-        "coverage_ok": bool(cov_ok),
-        "best_candidate_customer_id": best_cid,  # INTERNAL ONLY; never speak this
-        "ask_next": ask_next,
-        "features": artifacts.fz_features,
-        "privacy": {"enumerated": False},
-    }
-
-
-# -----------------------------------------------------------------------------
-# Transcript helpers
-# -----------------------------------------------------------------------------
-
-def _safe_calls_prefix(prefix: str) -> str:
-    p = (prefix or "").strip() or "calls/"
-    return p if p.endswith("/") else (p + "/")
-
-def _safe_blob_name(name: str) -> str:
-    return (name or "").replace("/", "_").replace("\\", "_").strip() or "unknown"
-
-def _history_to_transcript(session: AgentSession) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for item in getattr(session.history, "items", []):
-        if getattr(item, "type", None) == "message":
-            role = getattr(item, "role", "") or ""
-            text = getattr(item, "text_content", "") or ""
-            interrupted = bool(getattr(item, "interrupted", False))
-            if not (text or "").strip():
-                continue
-            mapped_role = "agent" if role == "assistant" else role
-            entry: Dict[str, Any] = {"role": mapped_role, "text": text}
-            if interrupted:
-                entry["interrupted"] = True
-            out.append(entry)
-    return out
-
-
-# -----------------------------------------------------------------------------
-# LiveKit Agent Server entrypoint
-# -----------------------------------------------------------------------------
-
-server = AgentServer()
-
-
-@server.rtc_session(agent_name=os.getenv("AGENT_NAME", "phone-assistant"))
-async def entrypoint(ctx: JobContext):
-    logger.info("Starting phone-agent in room=%s", getattr(ctx.room, "name", "?"))
-
-    # Optional: connect early (telephony setups behave better)
-    if AutoSubscribe is not None:
-        try:
-            await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)  # type: ignore[attr-defined]
-        except Exception:
-            logger.info("ctx.connect(auto_subscribe=AUDIO_ONLY) failed/unsupported (continuing).", exc_info=True)
-    else:
-        try:
-            await ctx.connect()  # type: ignore[attr-defined]
-        except Exception:
-            # Some versions auto-connect when session starts.
-            logger.debug("ctx.connect not available.", exc_info=True)
-
-    # Try to fetch caller number from participant attributes (if available)
-    caller_number: str = ""
-    try:
-        participant = await ctx.wait_for_participant()  # type: ignore[attr-defined]
-        attrs = getattr(participant, "attributes", {}) or {}
-        caller_number = (
-            attrs.get("sip.phoneNumber")
-            or attrs.get("caller.number")
-            or attrs.get("sip.callerNumber")
-            or ""
-        )
-        logger.info("Participant=%s caller_number=%s", getattr(participant, "identity", ""), caller_number)
-    except Exception:
-        # Not fatal; some deployments don't expose this
-        logger.debug("wait_for_participant not available or failed.", exc_info=True)
-
-    # ---------------------------------------------------------------
-    # Load config + customers (per call)
-    # ---------------------------------------------------------------
-    try:
-        cfg = await asyncio.to_thread(load_json_blob, CONFIG_BLOB)
-        if not isinstance(cfg, dict):
-            raise ValueError("Config is not a JSON object")
-    except ResourceNotFoundError:
-        logger.warning("Config blob not found: %s — using default config.", CONFIG_BLOB)
-        cfg = _default_config()
-    except Exception:
-        logger.exception("Failed to load config — using default config.")
-        cfg = _default_config()
-
-    storage_cfg = cfg.get("storage", {}) if isinstance(cfg, dict) else {}
-    customers_blob = (storage_cfg.get("customers_csv_blob") or CUSTOMERS_BLOB) if isinstance(storage_cfg, dict) else CUSTOMERS_BLOB
-    calls_prefix = (storage_cfg.get("calls_prefix") or CALLS_PREFIX) if isinstance(storage_cfg, dict) else CALLS_PREFIX
-
-    try:
-        customers = await asyncio.to_thread(load_csv_blob, customers_blob)
-    except Exception:
-        logger.exception("Failed to load customers CSV from blob=%s (continuing with empty list).", customers_blob)
-        customers = []
-
-    # Robust call_id
-    job_obj = getattr(ctx, "job", None)
-    call_id = (
-        getattr(job_obj, "id", None)
-        or getattr(job_obj, "dispatch_id", None)
-        or getattr(job_obj, "dispatchId", None)
-        or getattr(ctx.room, "name", None)
-        or "unknown"
-    )
-    call_id = _safe_blob_name(str(call_id))
-
-    artifacts = SessionArtifacts(
-        config=cfg,
-        customers=customers,
-        caller_number=caller_number or getattr(ctx.room, "name", "") or None,
-        call_id=call_id,
-    )
-
-    agent_cfg = cfg.get("agent", {}) if isinstance(cfg, dict) else {}
-    speech_cfg = cfg.get("speech", {}) if isinstance(cfg, dict) else {}
-    turn_cfg = cfg.get("turn", {}) if isinstance(cfg, dict) else {}
-    llm_cfg = cfg.get("llm", {}) if isinstance(cfg, dict) else {}
-    email_cfg = cfg.get("email", {}) if isinstance(cfg, dict) else {}
-    cv_cfg = cfg.get("customer_verification", {}) if isinstance(cfg, dict) else {}
-
-    # ---------------------------------------------------------------
-    # Turn detector (optional)
-    # ---------------------------------------------------------------
-    turn_detection = None
-    turn_enabled = bool((turn_cfg or {}).get("enabled", True))
-    preset = str((turn_cfg or {}).get("preset", "very_patient")).strip().lower()
-
-    if turn_enabled and preset not in ("off", "disabled", "false", "0", "no"):
-        if MultilingualModel is None:
-            logger.warning("Turn detector requested but MultilingualModel not available (disabled).")
-        else:
-            try:
-                turn_detection = MultilingualModel()  # type: ignore[call-arg]
-            except Exception:
-                logger.warning("Turn detector init failed (disabled).", exc_info=True)
-
-    # ---------------------------------------------------------------
-    # LLM (Azure OpenAI)
-    # ---------------------------------------------------------------
-    llm = openai_plugin.LLM.with_azure(
-        azure_deployment=_require_env("AZURE_OPENAI_DEPLOYMENT"),
-        azure_endpoint=_require_env("AZURE_OPENAI_ENDPOINT"),
-        api_key=_require_env("AZURE_OPENAI_API_KEY"),
-        api_version=DEFAULT_OPENAI_API_VERSION,
-        temperature=float((llm_cfg or {}).get("temperature", 0.2)),
-    )
-
-    # ---------------------------------------------------------------
-    # Speech (Azure Speech)
-    # ---------------------------------------------------------------
-    stt_langs = (speech_cfg or {}).get("stt_languages") or ["de-AT", "de-DE"]
-    if not isinstance(stt_langs, list):
-        stt_langs = ["de-AT", "de-DE"]
-
-    # Build optional phrase hints from customers (firmenname + standort)
-    phrase_hints: List[str] = []
-    try:
-        fuzzy_cfg = (cv_cfg.get("fuzzy") or {}) if isinstance(cv_cfg, dict) else {}
-        use_hints = bool((fuzzy_cfg.get("stt") or {}).get("phrase_hints", "") == "from_csv")
-        if use_hints and customers:
-            seen: Set[str] = set()
-            for r in customers:
-                for k in ("firmenname", "standort", "ort", "city"):
-                    v = (r.get(k) or "").strip()
-                    if not v:
-                        continue
-                    if v in seen:
-                        continue
-                    seen.add(v)
-                    phrase_hints.append(v)
-                    if len(phrase_hints) >= 500:
-                        break
-                if len(phrase_hints) >= 500:
-                    break
-    except Exception:
-        logger.debug("Failed to build phrase hints (continuing).", exc_info=True)
-
-    # Instantiate STT with optional hints (fallback if not supported)
-    try:
-        if phrase_hints:
-            try:
-                stt = azure_speech.STT(language=stt_langs, hints=phrase_hints)  # type: ignore[call-arg]
-            except TypeError:
-                # older versions may not support 'hints'
-                stt = azure_speech.STT(language=stt_langs)
-        else:
-            stt = azure_speech.STT(language=stt_langs)
-    except Exception:
-        logger.warning("azure_speech.STT(language=...) failed; falling back to default STT().", exc_info=True)
-        stt = azure_speech.STT()
-
-    try:
-        tts = azure_speech.TTS(
-            voice=(speech_cfg or {}).get("tts_voice", "de-DE-KatjaNeural"),
-            language=(speech_cfg or {}).get("tts_language", "de-DE"),
-        )
-    except Exception:
-        logger.warning("azure_speech.TTS(voice/language) failed; falling back to default TTS().", exc_info=True)
-        tts = azure_speech.TTS()
-
-    # ---------------------------------------------------------------
-    # Agent session
-    # ---------------------------------------------------------------
-    session = AgentSession(
-        userdata=artifacts,
-        stt=stt,
-        tts=tts,
-        turn_detection=turn_detection,
-        min_endpointing_delay=float((turn_cfg or {}).get("min_endpointing_delay", 1.5)),
-        max_endpointing_delay=float((turn_cfg or {}).get("max_endpointing_delay", 20.0)),
-        llm=llm,
-    )
-
-    # Prefer event-based transcript if supported
-    try:
-        @session.on("conversation_item_added")
-        def _on_item(ev: Any):  # ConversationItemAddedEvent, but keep it version-agnostic
-            item = getattr(ev, "item", None)
-            if item is None:
-                return
-            role = getattr(item, "role", "") or ""
-            text = getattr(item, "text_content", "") or ""
-            interrupted = bool(getattr(item, "interrupted", False))
-            if not (text or "").strip():
-                return
-            mapped_role = "agent" if role == "assistant" else role
-            artifacts.transcript.append({"role": mapped_role, "text": text, "interrupted": interrupted})
-    except Exception:
-        logger.debug("conversation_item_added event not available.", exc_info=True)
-
-    # ---------------------------------------------------------------
-    # Instructions (dashboard uses agent.system_prompt)
-    # ---------------------------------------------------------------
     base_prompt = (
-        """
-        Suche im CSV File und liefere den wahrscheinlichen Kundennamen als Antwort retour. Prüfe auch phonetisch.
-        Liefere das JSON Schema retour.  Beispiel: {
-        "kundenname": "Anna Schmidt"
-        }. Liefere nur das JSON als Antwort ohne Einleitungstext
-        """ 
-        +
-        (agent_cfg or {}).get("system_prompt")
-        or (agent_cfg or {}).get("instructions")
-        or (agent_cfg or {}).get("prompt")
+        agent_cfg.get("system_prompt")
+        or agent_cfg.get("instructions")
         or _default_config()["agent"]["system_prompt"]
     )
 
-    # Hard runtime constraints from config (so the agent behaves as configured)
-    ask_name = bool((cv_cfg or {}).get("ask_caller_name", True))
-    max_attempts = int((cv_cfg or {}).get("max_attempts", 3) or 3)
-    match_policy = str((cv_cfg or {}).get("match_policy", "firm_or_site") or "firm_or_site")
+    ask_name     = bool(cv_cfg.get("ask_caller_name", True))
+    max_attempts = int(cv_cfg.get("max_attempts", 3) or 3)
 
-    runtime_rules = (
-        "\n\n"
-        "Laufende Konfiguration (muss eingehalten werden):\n"
-        f"- Name des Anrufers abfragen: {'ja' if ask_name else 'nein'}\n"
-        f"- Max. Verifikationsversuche: {max_attempts}\n"
-        f"- Match Policy: {match_policy}\n"
-        "Regeln:\n"
-        "- Sprich immer deutsch.\n"
-        "- Kurze Sätze. Keine Emojis.\n"
-        "- Verifiziere den Kunden IMMER über das Tool verify_customer.\n"
-        "- Wenn locked=true zurückkommt: freundlich abbrechen oder an menschlichen Support verweisen.\n"
-        "- Nach erfolgreicher Verifikation: Serviceauftrag strukturiert aufnehmen und submit_service_order verwenden.\n"
+    runtime_rules_tmpl = (
+        agent_cfg.get("runtime_rules_template")
+        or _default_config()["agent"]["runtime_rules_template"]
     )
+    runtime_rules = _render_template(runtime_rules_tmpl, {
+        "ask_caller_name": "ja" if ask_name else "nein",
+        "max_attempts": str(max_attempts),
+    })
 
-    # Fuzzy addendum (privacy-first) — enabled by default (fallback-first)
-    fuzzy_cfg = (cv_cfg or {}).get("fuzzy", {}) if isinstance(cv_cfg, dict) else {}
-    fuzzy_enabled = bool((fuzzy_cfg or {}).get("enabled", True))
-    fuzzy_rules = ""
+    fuzzy_enabled = bool((cv_cfg.get("fuzzy") or {}).get("enabled", True))
+    fuzzy_rules   = ""
     if fuzzy_enabled:
         fuzzy_rules = (
-            "\n\n"
-            "Fuzzy-Suche & Datenschutz (verbindlich):\n"
-            "- Nutze zuerst search_customers zur internen Kandidatensuche.\n"
-            "- Nenne niemals Kandidaten, Adressen oder PLZ aus dem System.\n"
-            "- Stelle genau eine Frage pro Turn: PLZ, Ort, E-Mail-Domain oder Straßen-Prefix.\n"
-            "- Verifiziere nur, wenn decision=allow und coverage_ok=true. Sonst eine Zusatzfrage oder Eskalation.\n"
-            "- Gib niemals customer_id oder interne Systemdaten an den Anrufer weiter.\n"
-            "- Bestätige maskiert (z. B. 'Beginnt Ihre PLZ mit 50…?').\n"
-            "- Biete Buchstabieren an, wenn unklar.\n"
+            agent_cfg.get("fuzzy_rules")
+            or _default_config()["agent"]["fuzzy_rules"]
         )
 
-    instructions = (str(base_prompt).strip() + runtime_rules + fuzzy_rules).strip()
+    instructions = "\n\n".join(filter(None, [base_prompt, runtime_rules, fuzzy_rules])).strip()
+    return instructions
 
-    agent = Agent(
-        instructions=instructions,
-        tools=[verify_customer, submit_service_order, search_customers] if fuzzy_enabled else [verify_customer, submit_service_order],
-    )
 
-    # ---------------------------------------------------------------
-    # Shutdown callback → persist log to Blob + optional email
-    # ---------------------------------------------------------------
-    async def persist_and_notify():
-        # Build transcript
-        transcript = artifacts.transcript or _history_to_transcript(session)
+# ═══════════════════════════════════════════════════════════════════════════
+# §14  Email notification (optional)
+# ═══════════════════════════════════════════════════════════════════════════
 
-        payload: Dict[str, Any] = {
-            "call_id": call_id,
-            "room": getattr(ctx.room, "name", ""),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "caller": artifacts.caller_number,
-            "config_meta": (cfg.get("meta") if isinstance(cfg, dict) else None),
-            "verified_customer": asdict(artifacts.verified_customer) if artifacts.verified_customer else None,
-            "service_order": asdict(artifacts.service_order) if artifacts.service_order else None,
-            "transcript": transcript,
-            "summary": artifacts.summary,
+def _send_email_notification(
+    call_log: Dict[str, Any],
+    cfg: Dict[str, Any],
+    artifacts: SessionArtifacts,
+) -> None:
+    try:
+        if not HAS_ACS_EMAIL:
+            return
+        email_cfg = cfg.get("email") or {}
+        if not email_cfg.get("enabled", False):
+            return
+
+        conn_str = (
+            _get_secret("AZURE_COMMUNICATION_CONNECTION_STRING")
+            or os.environ.get("COMMUNICATION_CONNECTION_STRING_EMAIL")
+            or ""
+        )
+        if not conn_str:
+            logger.debug("No ACS email connection string — skipping email.")
+            return
+
+        sender = email_cfg.get("sender", "")
+        recipients_raw = email_cfg.get("recipients") or []
+        if not sender or not recipients_raw:
+            logger.debug("Email sender or recipients missing — skipping.")
+            return
+
+        call_id = artifacts.call_id or "unknown"
+        customer_id = ""
+        room = call_id
+        if artifacts.verified_customer:
+            customer_id = artifacts.verified_customer.customer_id
+
+        subject_tmpl = email_cfg.get("subject_template", "Service Call {{callId}}")
+        subject = _render_template(subject_tmpl, {
+            "callId": call_id,
+            "room": room,
+            "customerId": customer_id,
+        })
+
+        # Plain-text body
+        lines = [
+            f"Call ID: {call_id}",
+            f"Caller: {artifacts.caller_number or 'unknown'}",
+        ]
+        if artifacts.verified_customer:
+            vc = artifacts.verified_customer
+            lines.append(f"Customer: {vc.firmenname} (ID: {vc.customer_id})")
+            lines.append(f"Caller name: {vc.caller_name}")
+        if artifacts.service_order:
+            so = artifacts.service_order
+            lines.append(f"Order: {so.order_id} — {so.problem} (priority: {so.priority})")
+        body = "\n".join(lines)
+
+        # Attachments
+        call_log_b64 = base64.b64encode(
+            json.dumps(call_log, ensure_ascii=False, indent=2).encode("utf-8")
+        ).decode("ascii")
+        config_b64 = base64.b64encode(
+            json.dumps(cfg, ensure_ascii=False, indent=2).encode("utf-8")
+        ).decode("ascii")
+
+        to_list = [{"address": r, "displayName": r} for r in recipients_raw]
+
+        message = {
+            "senderAddress": sender,
+            "recipients": {"to": to_list},
+            "content": {"subject": subject, "plainText": body},
+            "attachments": [
+                {
+                    "name": f"call_{call_id}.json",
+                    "contentType": "application/json",
+                    "contentInBase64": call_log_b64,
+                },
+                {
+                    "name": f"config_{call_id}.json",
+                    "contentType": "application/json",
+                    "contentInBase64": config_b64,
+                },
+            ],
         }
 
-        # Add masked fuzzy diagnostics (no PII)
-        try:
-            payload["fuzzy_diagnostics"] = {
-                "enabled": bool(fuzzy_enabled),
+        email_client = EmailClient.from_connection_string(conn_str)
+        poller = email_client.begin_send(message)
+        poller.result()
+        logger.info("Email notification sent for call %s", call_id)
+
+    except Exception:
+        logger.exception("Failed to send email notification.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# §13/14  Shutdown / persist callback
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def persist_and_notify(
+    artifacts: SessionArtifacts,
+    cfg: Dict[str, Any],
+    ctx: JobContext,
+) -> None:
+    try:
+        call_id = artifacts.call_id or "unknown"
+        room_name = ctx.room.name if ctx.room else call_id
+
+        vc_dict = None
+        if artifacts.verified_customer:
+            vc = artifacts.verified_customer
+            vc_dict = {
+                "customer_id": vc.customer_id,
+                "firmenname": vc.firmenname,
+                "standort": vc.standort,
+                "adresse": vc.adresse,
+                "country": vc.country,
+                "caller_name": vc.caller_name,
+            }
+
+        so_dict = None
+        if artifacts.service_order:
+            so = artifacts.service_order
+            so_dict = {
+                "order_id": so.order_id,
+                "problem": so.problem,
+                "priority": so.priority,
+                "contact_phone": so.contact_phone,
+                "preferred_time": so.preferred_time,
+                "timestamp_utc": so.timestamp_utc,
+            }
+
+        cv_cfg = (cfg.get("customer_verification") or {})
+        fuzzy_cfg = cv_cfg.get("fuzzy") or {}
+        fuzzy_enabled = bool(fuzzy_cfg.get("enabled", True))
+
+        call_log: Dict[str, Any] = {
+            "call_id": call_id,
+            "room": room_name,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "caller": artifacts.caller_number or "",
+            "config_meta": cfg.get("meta") or {},
+            "verified_customer": vc_dict,
+            "service_order": so_dict,
+            "transcript": artifacts.transcript,
+            "summary": artifacts.summary,
+            "fuzzy_diagnostics": {
+                "enabled": fuzzy_enabled,
                 "decision": artifacts.fz_decision,
                 "score": artifacts.fz_score,
                 "coverage_ok": artifacts.fz_coverage_ok,
                 "features": artifacts.fz_features,
-                "asked_features": artifacts.fz_asked,
-                "privacy": {"no_candidate_enumeration": True},
-            }
-        except Exception:
-            logger.debug("Adding fuzzy diagnostics failed (continuing).", exc_info=True)
-
-        # 1) write to blob
-        try:
-            log_path = f"{_safe_calls_prefix(calls_prefix)}{call_id}.json"
-            await asyncio.to_thread(write_json_blob, log_path, payload)
-            logger.info("Call log written to %s", log_path)
-        except Exception:
-            logger.exception("Failed to persist call log to blob")
-
-        # 2) optional email
-        try:
-            enabled = bool((email_cfg or {}).get("enabled", False))
-            if not enabled:
-                return
-
-            sender = str((email_cfg or {}).get("sender", "") or "").strip()
-            recipients = (email_cfg or {}).get("recipients", []) or []
-            if not isinstance(recipients, list):
-                recipients = []
-            recipients = [str(r).strip() for r in recipients if str(r).strip()]
-
-            subject_tmpl = str((email_cfg or {}).get("subject_template", "Service Call {{callId}}") or "Service Call {{callId}}")
-            subject = _render_subject(
-                subject_tmpl,
-                {
-                    "callId": call_id,
-                    "room": str(getattr(ctx.room, "name", "") or ""),
-                    "customerId": str(getattr(artifacts.verified_customer, "customer_id", "") or ""),
+                "asked_features": list(artifacts.fz_asked),
+                "privacy": {
+                    "no_candidate_enumeration": bool(
+                        (fuzzy_cfg.get("privacy") or {}).get("no_candidate_enumeration", True)
+                    ),
                 },
-            )
+            },
+        }
 
-            # Short email body (details are attachments)
-            lines: List[str] = []
-            lines.append(f"Call ID: {call_id}")
-            if artifacts.caller_number:
-                lines.append(f"Caller: {artifacts.caller_number}")
-            if artifacts.verified_customer:
-                lines.append(
-                    f"Kunde: {artifacts.verified_customer.customer_id} / {artifacts.verified_customer.firmenname} / {artifacts.verified_customer.standort}"
-                )
-            if artifacts.service_order:
-                lines.append(f"Auftrag: {artifacts.service_order.order_id} Priorität={artifacts.service_order.priority}")
-                if artifacts.service_order.problem:
-                    lines.append(f"Problem: {artifacts.service_order.problem[:300]}")
-            body = "\n".join(lines)
+        blob_path = f"{CALLS_PREFIX}{call_id}.json"
+        upload_blob_text(blob_path, json.dumps(call_log, ensure_ascii=False, indent=2))
+        logger.info("Call log uploaded: %s", blob_path)
 
-            # Attach call log + config snapshot
-            call_bytes = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
-            cfg_bytes = json.dumps(cfg, ensure_ascii=False, indent=2).encode("utf-8")
+        _send_email_notification(call_log, cfg, artifacts)
 
-            attachments = [
-                (f"call_{call_id}.json", "application/json", call_bytes),
-                (f"config_{call_id}.json", "application/json", cfg_bytes),
-            ]
+    except Exception:
+        logger.exception("Error in persist_and_notify — swallowed to avoid crash.")
 
-            await asyncio.to_thread(
-                _send_email_with_attachments,
-                subject,
-                body,
-                sender,
-                recipients,
-                attachments,
-            )
-        except Exception:
-            logger.exception("Email notification failed")
 
-    ctx.add_shutdown_callback(persist_and_notify)
+# ═══════════════════════════════════════════════════════════════════════════
+# §12  Entrypoint
+# ═══════════════════════════════════════════════════════════════════════════
 
-    # ---------------------------------------------------------------
-    # Start session & welcome
-    # ---------------------------------------------------------------
+async def entrypoint(ctx: JobContext) -> None:
+    # 1. Connect to LiveKit room (audio only)
+    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+    logger.info("Connected to room: %s", ctx.room.name)
+
+    # 2. Wait for participant, extract caller number
+    participant = await ctx.wait_for_participant()
+    caller_number = ""
+    sip_attrs = participant.attributes or {}
+    for key in ("sip.phoneNumber", "caller.number", "sip.callerNumber"):
+        val = sip_attrs.get(key, "")
+        if val:
+            caller_number = val
+            break
+    logger.info("Participant joined — caller: %s", caller_number or "unknown")
+
+    # 3. Load blob config
+    cfg = load_config()
+
+    # Bootstrap Azure OpenAI credentials: KV cache → env vars → blob config → raise
+    ao_cfg = cfg.get("azure_openai") or {}
+    azure_endpoint = _get_secret("AZURE_OPENAI_ENDPOINT") or ao_cfg.get("endpoint") or ""
+    azure_api_key  = _get_secret("AZURE_OPENAI_API_KEY")  or ao_cfg.get("api_key")  or ""
+    azure_deploy   = os.environ.get("AZURE_OPENAI_DEPLOYMENT") or ao_cfg.get("deployment") or "gpt-5-mini"
+    azure_api_ver  = os.environ.get("OPENAI_API_VERSION") or ao_cfg.get("api_version") or "2025-01-01-preview"
+
+    if not azure_endpoint or not azure_api_key:
+        raise RuntimeError(
+            "Azure OpenAI credentials missing. Set AZURE_OPENAI_ENDPOINT and "
+            "AZURE_OPENAI_API_KEY as env vars or in blob config azure_openai.*"
+        )
+
+    # Bootstrap Azure Speech credentials
+    az_speech_cfg = cfg.get("azure_speech") or {}
+    speech_cfg    = cfg.get("speech") or {}
+    speech_key    = _get_secret("AZURE_SPEECH_KEY")    or az_speech_cfg.get("key")    or ""
+    speech_region = _get_secret("AZURE_SPEECH_REGION") or az_speech_cfg.get("region") or ""
+    speech_lang   = speech_cfg.get("language") or "de-DE"
+    tts_voice     = speech_cfg.get("tts_voice") or "de-DE-ConradNeural"
+
+    if not speech_key or not speech_region:
+        raise RuntimeError(
+            "Azure Speech credentials missing. Set AZURE-SPEECH-KEY and "
+            "AZURE-SPEECH-REGION in Key Vault, or azure_speech.* in blob config."
+        )
+
+    # 4. Bootstrap LiveKit credentials (non-fatal)
+    lk_cfg = cfg.get("livekit") or {}
+    lk_url    = os.environ.get("LIVEKIT_URL")        or lk_cfg.get("url")        or ""
+    lk_key    = _get_secret("LIVEKIT_API_KEY")    or lk_cfg.get("api_key")    or ""
+    lk_secret = _get_secret("LIVEKIT_API_SECRET") or lk_cfg.get("api_secret") or ""
+    if lk_url:
+        os.environ.setdefault("LIVEKIT_URL", lk_url)
+    if lk_key:
+        os.environ.setdefault("LIVEKIT_API_KEY", lk_key)
+    if lk_secret:
+        os.environ.setdefault("LIVEKIT_API_SECRET", lk_secret)
+
+    # 5. Load customers CSV
+    storage_cfg = cfg.get("storage") or {}
+    global CUSTOMERS_BLOB
+    cust_blob = storage_cfg.get("customers_csv_blob") or CUSTOMERS_BLOB
+    customers = load_customers()
+    logger.info("Loaded %d customers from CSV.", len(customers))
+
+    # 6. Derive call_id
+    call_id = ""
+    if hasattr(ctx, "job") and ctx.job:
+        call_id = getattr(ctx.job, "id", "") or getattr(ctx.job, "dispatch_id", "") or ""
+    if not call_id:
+        call_id = ctx.room.name if ctx.room else "unknown"
+
+    # 7. Create SessionArtifacts
+    artifacts = SessionArtifacts(
+        config=cfg,
+        customers=customers,
+        caller_number=caller_number,
+        call_id=call_id,
+    )
+
+    # 8. Build STT + TTS (Azure Speech) + LLM (Azure OpenAI chat completions)
+    llm_cfg     = cfg.get("llm") or {}
+    temperature = float(llm_cfg.get("temperature", 0.2))
+
+    stt = livekit_azure.STT(
+        speech_key=speech_key,
+        speech_region=speech_region,
+        language=speech_lang,
+    )
+    tts = livekit_azure.TTS(
+        speech_key=speech_key,
+        speech_region=speech_region,
+        voice=tts_voice,
+    )
+    llm = livekit_openai.LLM.with_azure(
+        model=azure_deploy,
+        azure_endpoint=azure_endpoint,
+        api_key=azure_api_key,
+        api_version=azure_api_ver,
+        temperature=temperature,
+    )
+
+    # 9. Build system prompt
+    instructions = _build_system_prompt(cfg)
+
+    # 10. Create Agent
+    cv_cfg = cfg.get("customer_verification") or {}
+    fuzzy_cfg = (cv_cfg.get("fuzzy") or {})
+    fuzzy_enabled = bool(fuzzy_cfg.get("enabled", True))
+    tools = [verify_customer, submit_service_order]
+    if fuzzy_enabled:
+        tools.append(search_customers)
+
+    agent = Agent(
+        instructions=instructions,
+        tools=tools,
+    )
+
+    # 11. Register shutdown callback
+    async def _shutdown() -> None:
+        await persist_and_notify(artifacts, cfg, ctx)
+
+    ctx.add_shutdown_callback(_shutdown)
+
+    # 12. Start AgentSession
+    session = AgentSession(userdata=artifacts, stt=stt, llm=llm, tts=tts)
     await session.start(agent=agent, room=ctx.room)
 
-    # Prefer configured welcome; otherwise fallback-first text already in defaults
-    welcome = (agent_cfg or {}).get(
-        "welcome_message",
-        _default_config()["agent"]["welcome_message"],
+    # 13. Say welcome message
+    agent_cfg = cfg.get("agent") or {}
+    welcome = (
+        agent_cfg.get("welcome_message")
+        or _default_config()["agent"]["welcome_message"]
     )
-    await session.say(str(welcome), allow_interruptions=False)
+    await session.say(welcome, allow_interruptions=False)
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# §16  CLI bootstrap
+# ═══════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    cli.run_app(server)
+    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, agent_name=AGENT_NAME))
