@@ -1224,6 +1224,22 @@ async def entrypoint(ctx: JobContext) -> None:
         session_kwargs["max_endpointing_delay"] = max_ep
 
     session = AgentSession(**session_kwargs)
+
+    # 11b. Capture transcript turns
+    @session.on("conversation_item_added")
+    def _on_conversation_item(ev) -> None:
+        item = ev.item
+        if not hasattr(item, "role") or item.role not in ("user", "assistant"):
+            return
+        text = (item.text_content or "").strip()
+        if not text:
+            return
+        artifacts.transcript.append({
+            "role": "user" if item.role == "user" else "agent",
+            "text": text,
+            "interrupted": getattr(item, "interrupted", False),
+        })
+
     await session.start(agent=agent, room=ctx.room)
 
     # 13. Say welcome message
